@@ -8,6 +8,8 @@ from astropy.io import fits
 from pypower import CatalogFFTPower
 
 DEFAULT_DATA_ROOT = '/pscratch/sd/v/vtorresg/hod-astra-box500'
+DEFAULT_KMAX = 0.5
+DEFAULT_K_BIN_WIDTH_FACTOR = 2.0
 ENVIRONMENTS = ('void', 'sheet', 'filament', 'knot')
 PROB_COLS = {'void': 'PVOID',
              'sheet': 'PSHEET',
@@ -44,13 +46,12 @@ def parse_args():
     parser.add_argument('--interlacing', type=int, default=2)
     parser.add_argument('--engine', type=str, default='pypower')
     parser.add_argument('--position-cols', nargs=3, default=['XCART', 'YCART', 'ZCART'])
-    parser.add_argument('--weight-col', type=str, default='', help='If omitted, all selected galaxies get weight 1.')
+    parser.add_argument('--weight-col', type=str, default='')
     parser.add_argument('--data-randiter', type=int, default=-1)
     parser.add_argument('--use-all-rows', action='store_true')
-    parser.add_argument('--subtract-shotnoise', action='store_true',
-                        help='Write pk_used = pk_raw - shotnoise.')
-    parser.add_argument('--k-bin-width', type=float, default=0.0, help='k-bin width. Default is the fundamental mode 2*pi/boxsize.')
-    parser.add_argument('--kmax', type=float, default=0.0, help='Maximum k edge. Default is the mesh Nyquist frequency.')
+    parser.add_argument('--subtract-shotnoise', action='store_true')
+    parser.add_argument('--k-bin-width', type=float, default=0.0)
+    parser.add_argument('--kmax', type=float, default=DEFAULT_KMAX)
     parser.add_argument('--unmatched-policy', type=str, default='error', choices=['error', 'drop'])
     parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--skip-existing', action='store_true')
@@ -161,7 +162,16 @@ def resolve_outdir(args):
     else:
         outdir = Path(args.data_root).expanduser() / 'power_spectra'
     outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / 'meta').mkdir(parents=True, exist_ok=True)
     return outdir
+
+
+def resolve_job_outdir(outdir, job):
+    job_outdir = Path(outdir) / job.hod / job.cosmo
+    job_outdir.mkdir(parents=True, exist_ok=True)
+    (job_outdir / 'meta').mkdir(parents=True, exist_ok=True)
+    (job_outdir / 'plots').mkdir(parents=True, exist_ok=True)
+    return job_outdir
 
 
 def read_fits_columns(path, columns):
@@ -270,13 +280,51 @@ def mas_to_resampler(mas):
 
 
 def make_k_edges(boxsize, nmesh, k_bin_width, kmax):
-    dk = 2.0 * np.pi / float(boxsize) if k_bin_width <= 0.0 else float(k_bin_width)
-    k_nyquist = np.pi * float(nmesh) / float(boxsize)
+    """Return fixed k-bin edges shared by every P(k) for one catalog."""
+    boxsize = float(boxsize)
+    nmesh = int(nmesh)
+    if boxsize <= 0.0:
+        raise ValueError(f'boxsize must be positive, got {boxsize}.')
+    if nmesh <= 0:
+        raise ValueError(f'nmesh must be positive, got {nmesh}.')
+
+    k_fundamental = 2.0 * np.pi / boxsize
+    dk = DEFAULT_K_BIN_WIDTH_FACTOR * k_fundamental if k_bin_width <= 0.0 else float(k_bin_width)
+    if not np.isfinite(dk) or dk <= 0.0:
+        raise ValueError(f'k-bin width must be positive, got {dk}.')
+
+    k_nyquist = np.pi * float(nmesh) / boxsize
     k_stop = k_nyquist if kmax <= 0.0 else min(float(kmax), k_nyquist)
-    edges = np.arange(0.0, k_stop + 0.5 * dk, dk, dtype=np.float64)
-    if edges.size < 2 or edges[-1] < k_stop:
-        edges = np.append(edges, k_stop)
+    if not np.isfinite(k_stop) or k_stop <= 0.0:
+        raise ValueError(f'kmax must define a positive k range, got {kmax}.')
+
+    n_bins = max(1, int(np.ceil(k_stop / dk - 1.0e-12)))
+    edges = dk * np.arange(n_bins + 1, dtype=np.float64)
     return edges
+
+
+def k_binning_metadata(edges, boxsize, nmesh, requested_k_bin_width, requested_kmax):
+    edges = np.asarray(edges, dtype=np.float64)
+    widths = np.diff(edges)
+    k_fundamental = 2.0 * np.pi / float(boxsize)
+    k_nyquist = np.pi * float(nmesh) / float(boxsize)
+    target_kmax = float(requested_kmax)
+    if widths.size:
+        binning_kmax = target_kmax if target_kmax > 0.0 else k_nyquist
+        nominal_n_bins = binning_kmax / widths[0]
+    else:
+        nominal_n_bins = np.nan
+    return {'fundamental_mode_h_mpc': float(k_fundamental),
+            'delta_k_h_mpc': float(widths[0]) if widths.size else np.nan,
+            'delta_k_over_k_fundamental': float(widths[0] / k_fundamental) if widths.size else np.nan,
+            'binning_rule': 'Delta k = 2 * k_fundamental = 4*pi/boxsize',
+            'nominal_n_bins_target_kmax_over_delta_k': float(nominal_n_bins) if widths.size else np.nan,
+            'n_bins': int(widths.size),
+            'k_min_edge_h_mpc': float(edges[0]) if edges.size else np.nan,
+            'k_max_edge_h_mpc': float(edges[-1]) if edges.size else np.nan,
+            'target_kmax_h_mpc': target_kmax,
+            'nyquist_h_mpc': float(k_nyquist),
+            'requested_k_bin_width_h_mpc': float(requested_k_bin_width)}
 
 
 def to_scalar_float(value, default=np.nan):
@@ -381,6 +429,7 @@ def compute_pk(positions, weights, edges, args):
     if positions.shape[0] == 0:
         raise RuntimeError('Cannot compute P(k): selected field has zero galaxies.')
     result = compute_pk_pypower(positions, weights, edges, args)
+    result['k_edges'] = np.asarray(edges, dtype=np.float64).copy()
 
     volume = float(args.boxsize) ** 3
     sw = float(np.sum(weights, dtype=np.float64))
@@ -416,8 +465,15 @@ def write_csv(path, results):
     fields = list(results)
     first = results[fields[0]]
     k = first['k']
-    cols = [k, first['nmodes']]
-    headers = ['k_h_mpc', 'nmodes']
+    k_edges = np.asarray(first.get('k_edges', []), dtype=np.float64)
+    if k_edges.size == k.size + 1:
+        k_min = k_edges[:-1]
+        k_max = k_edges[1:]
+    else:
+        k_min = np.full_like(k, np.nan, dtype=np.float64)
+        k_max = np.full_like(k, np.nan, dtype=np.float64)
+    cols = [k, k_min, k_max, first['nmodes']]
+    headers = ['k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc', 'nmodes']
     for field in fields:
         result = results[field]
         cols.append(align_to_k(k, result['k'], result['pk_raw']))
@@ -480,9 +536,10 @@ def result_metadata(result):
 
 def process_job(job, args, outdir):
     requested_fields = expand_requested_fields(args.field)
-    csv_path = outdir / f'pk_{args.field}_{job.tag}.csv'
-    meta_path = outdir / 'meta' / f'run_metadata_pk_{args.field}_{job.tag}.json'
-    plot_path = outdir / 'plots' / f'pk_{args.field}_{job.tag}.png'
+    job_outdir = resolve_job_outdir(outdir, job)
+    csv_path = job_outdir / f'pk_{args.field}_{job.tag}.csv'
+    meta_path = job_outdir / 'meta' / f'run_metadata_pk_{args.field}_{job.tag}.json'
+    plot_path = job_outdir / 'plots' / f'pk_{args.field}_{job.tag}.png'
 
     if args.skip_existing and csv_path.is_file():
         print(f'---> skipping existing: {csv_path}')
@@ -502,6 +559,11 @@ def process_job(job, args, outdir):
         print(f"---> {job.tag}: ASTRA class counts {class_info['class_counts']}")
 
     edges = make_k_edges(args.boxsize, args.grid, args.k_bin_width, args.kmax)
+    binning = k_binning_metadata(edges, args.boxsize, args.grid, args.k_bin_width, args.kmax)
+    print("---> k-binning: "
+          f"{binning['n_bins']} bins, "
+          f"Delta k = {binning['delta_k_h_mpc']:.8f} h/Mpc, "
+          f"kmax edge = {binning['k_max_edge_h_mpc']:.8f} h/Mpc")
     positions = raw['positions']
     weights = raw['weights']
     results = {}
@@ -540,6 +602,7 @@ def process_job(job, args, outdir):
                 'phase': job.phase,
                 'seed': job.seed,
                 'hod': job.hod,
+                'output_directory': str(job_outdir),
                 'field_requested': args.field,
                 'fields_computed': requested_fields,
                 'raw_selection': raw,
@@ -555,6 +618,7 @@ def process_job(job, args, outdir):
                 'subtract_shotnoise': args.subtract_shotnoise,
                 'k_bin_width': args.k_bin_width,
                 'kmax': args.kmax,
+                'binning': binning,
                 'outputs': {'csv': str(csv_path),
                             'metadata': str(meta_path),
                             'plot': str(plot_path) if plot_written else None}}
