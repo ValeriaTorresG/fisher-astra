@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument('--hod', nargs='+', default=['all'])
     parser.add_argument('--pk-kind', type=str, default='pk_used', choices=['pk_used', 'pk_raw'])
     parser.add_argument('--observable', type=str, default='f2pk', choices=OBSERVABLE_KINDS)
-    parser.add_argument('--derivative-kind', type=str, default='log', choices=DERIVATIVE_KINDS)
+    parser.add_argument('--derivative-kind', type=str, default='linear', choices=DERIVATIVE_KINDS)
     parser.add_argument('--finite-difference', type=str, default='central', choices=FINITE_DIFFERENCE_SCHEMES)
     parser.add_argument('--pk-file-field', type=str, default='')
     add_bool_argument(parser, '--match-realizations', True, 'Use only HOD/phase/seed realizations present in both cosmologies')

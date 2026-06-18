@@ -216,6 +216,7 @@ def plot_normalized_power(csv_path, fields, pk_kind, metadata_path, cli_counts, 
     fig.tight_layout()
     output_path = make_output_path(csv_path, outdir)
     fig.savefig(output_path, dpi=220)
+    print(f'---> saved plot to {output_path}')
     if show:
         plt.show()
     plt.close(fig)
