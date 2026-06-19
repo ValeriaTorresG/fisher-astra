@@ -6,25 +6,37 @@ import numpy as np
 
 from calc_deriv_cosmo import (DEFAULT_PK_ROOT, ENVIRONMENT_FIELDS, FIELDS,
                               PARAM_ALIASES, PARAM_SPECS)
+from calc_deriv_hod import HOD_PARAMS
 
 
 DATA_FIELDS = tuple(FIELDS)
 CASE_CHOICES = DATA_FIELDS + ('combined', 'all')
 DERIVATIVE_PREFIXES = ('dO_d', 'dpk_d', 'dlnO_d', 'dlnpk_d')
 LOG_PREFIXES = ('dlnO_d', 'dlnpk_d')
+DERIVATIVE_FILENAMES = {
+    'cosmo': ('deriv_cosmo.csv', 'deriv_cosmo_combined_env.csv'),
+    'hod': ('deriv_hod.csv', 'deriv_hod_combined_env.csv')}
+PARAMETER_GROUPS = {
+    'cosmo': tuple(PARAM_SPECS),
+    'hod': tuple(HOD_PARAMS)}
 DerivativeRecord = SimpleNamespace
 Component = SimpleNamespace
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    default_deriv_dir = Path(DEFAULT_PK_ROOT) / 'cosmo_derivatives'
+    default_cosmo_deriv_dir = Path(DEFAULT_PK_ROOT) / 'cosmo_derivatives'
+    default_hod_deriv_dir = Path(DEFAULT_PK_ROOT) / 'hod_derivatives'
     default_cov_dir = Path(DEFAULT_PK_ROOT) / 'covariances' / 'c000'
-    default_outdir = Path(DEFAULT_PK_ROOT) / 'fisher_cosmo'
+    default_outdir = Path(DEFAULT_PK_ROOT) / 'fisher_cosmo_hod'
 
-    parser.add_argument('--deriv-dir', type=str, default=str(default_deriv_dir))
+    parser.add_argument('--deriv-dir', type=str, default='')
+    parser.add_argument('--cosmo-deriv-dir', type=str, default=str(default_cosmo_deriv_dir))
     parser.add_argument('--derivatives-file', type=str, default='')
     parser.add_argument('--combined-derivatives-file', type=str, default='')
+    parser.add_argument('--hod-deriv-dir', type=str, default=str(default_hod_deriv_dir))
+    parser.add_argument('--hod-derivatives-file', type=str, default='')
+    parser.add_argument('--hod-combined-derivatives-file', type=str, default='')
     parser.add_argument('--cov-dir', type=str, default=str(default_cov_dir))
     parser.add_argument('--outdir', type=str, default=str(default_outdir))
     parser.add_argument('--cases', nargs='+', default=['all'], choices=CASE_CHOICES)
@@ -33,6 +45,8 @@ def parse_args():
     parser.add_argument('--rcond', type=float, default=1.0e-12)
     parser.add_argument('--hartlap-correction', action='store_true')
     parser.add_argument('--allow-log-derivatives', action='store_true')
+    parser.add_argument('--no-hod-derivatives', dest='include_hod_derivatives', action='store_false',)
+    parser.set_defaults(include_hod_derivatives=True)
     return parser.parse_args()
 
 
@@ -52,19 +66,44 @@ def case_name(case):
 
 def normalize_params(values, available):
     if any(value == 'all' for value in values):
-        ordered = [parameter for parameter in PARAM_SPECS if parameter in available]
-        ordered += [parameter for parameter in available if parameter not in ordered]
-        return ordered
+        return ordered_available_parameters(available)
 
     params = []
     for value in values:
-        parameter = PARAM_ALIASES.get(value, value)
-        if parameter not in available:
-            raise RuntimeError(f'Parameter {value} is not available in the derivative files. '
-                               f'Available: {", ".join(available)}')
-        if parameter not in params:
-            params.append(parameter)
+        token = str(value).strip()
+        token_lower = token.lower()
+        if token_lower in ('cosmo', 'cosmology', 'cosmological'):
+            expanded = [parameter for parameter in PARAMETER_GROUPS['cosmo']
+                        if parameter in available]
+        elif token_lower == 'hod':
+            expanded = [parameter for parameter in PARAMETER_GROUPS['hod']
+                        if parameter in available]
+        else:
+            parameter = normalize_parameter_name(token)
+            if parameter not in available:
+                raise RuntimeError(f'Parameter {value} is not available in the derivative files. '
+                                   f'Available: {", ".join(available)}')
+            expanded = [parameter]
+        for parameter in expanded:
+            if parameter not in params:
+                params.append(parameter)
     return params
+
+
+def normalize_parameter_name(value):
+    if value in PARAM_ALIASES:
+        return PARAM_ALIASES[value]
+    hod_aliases = {parameter.lower(): parameter for parameter in HOD_PARAMS}
+    return hod_aliases.get(str(value).strip().lower(), value)
+
+
+def ordered_available_parameters(available):
+    ordered = [parameter for parameter in PARAMETER_GROUPS['cosmo']
+               if parameter in available]
+    ordered += [parameter for parameter in PARAMETER_GROUPS['hod']
+                if parameter in available and parameter not in ordered]
+    ordered += [parameter for parameter in available if parameter not in ordered]
+    return ordered
 
 
 def derivative_column_info(column):
@@ -124,17 +163,17 @@ def load_combined_derivatives(path):
         raise RuntimeError(f'Mixed derivative kinds found in {path}: {sorted(derivative_kinds)}')
 
     records = []
-    field_counts = {field: 0 for field in DATA_FIELDS}
+    seen_fields = set()
     for row in rows:
         field = row.get('field', '').strip()
         if field not in DATA_FIELDS:
             continue
-        k_index = field_counts[field]
-        field_counts[field] += 1
+        if field in seen_fields:
+            raise RuntimeError(f'Expected one full-range derivative row for {field} in {path}.')
+        seen_fields.add(field)
         values = {parameter: parse_float(row[column], path, column)
                   for parameter, column in derivative_columns.items()}
         records.append(DerivativeRecord(field=field,
-                                        k_index=k_index,
                                         k_h_mpc=parse_float(row['k_h_mpc'], path, 'k_h_mpc'),
                                         k_min_h_mpc=parse_float(row['k_min_h_mpc'], path, 'k_min_h_mpc'),
                                         k_max_h_mpc=parse_float(row['k_max_h_mpc'], path, 'k_max_h_mpc'),
@@ -166,10 +205,12 @@ def load_matrix_derivatives(path):
         raise RuntimeError(f'No field derivative columns found in {path}')
     if len(derivative_kinds) != 1:
         raise RuntimeError(f'Mixed derivative kinds found in {path}: {sorted(derivative_kinds)}')
+    if len(rows) != 1:
+        raise RuntimeError(f'Expected one full-range derivative row in {path}, found {len(rows)}.')
 
     records = []
     for field in [item for item in DATA_FIELDS if item in fields]:
-        for k_index, row in enumerate(rows):
+        for row in rows:
             values = {}
             for parameter in parameters:
                 column = columns_by_field_param.get((field, parameter))
@@ -178,7 +219,6 @@ def load_matrix_derivatives(path):
             if values:
                 records.append(DerivativeRecord(
                     field=field,
-                    k_index=k_index,
                     k_h_mpc=parse_float(row['k_h_mpc'], path, 'k_h_mpc'),
                     k_min_h_mpc=parse_float(row['k_min_h_mpc'], path, 'k_min_h_mpc'),
                     k_max_h_mpc=parse_float(row['k_max_h_mpc'], path, 'k_max_h_mpc'),
@@ -186,14 +226,16 @@ def load_matrix_derivatives(path):
     return records, parameters, next(iter(derivative_kinds))
 
 
-def load_derivatives(deriv_dir, derivatives_file, combined_derivatives_file):
+def load_derivatives(deriv_dir, derivatives_file, combined_derivatives_file,
+                     derivative_family):
     deriv_dir = Path(deriv_dir).expanduser().resolve()
+    matrix_name, combined_name = DERIVATIVE_FILENAMES[derivative_family]
     combined_path = (Path(combined_derivatives_file).expanduser().resolve()
                      if combined_derivatives_file
-                     else deriv_dir / 'deriv_cosmo_combined_env.csv')
+                     else deriv_dir / combined_name)
     matrix_path = (Path(derivatives_file).expanduser().resolve()
                    if derivatives_file
-                   else deriv_dir / 'deriv_cosmo.csv')
+                   else deriv_dir / matrix_name)
 
     if matrix_path.is_file():
         records, parameters, derivative_kind = load_matrix_derivatives(matrix_path)
@@ -205,19 +247,119 @@ def load_derivatives(deriv_dir, derivatives_file, combined_derivatives_file):
     raise RuntimeError(f'Cannot find derivative inputs. Tried {combined_path} and {matrix_path}.')
 
 
+def derivative_metadata_path(derivative_path):
+    path = Path(derivative_path)
+    stem = path.stem.replace('_combined_env', '')
+    metadata_path = path.parent / f'{stem}_metadata.json'
+    return metadata_path if metadata_path.is_file() else None
+
+
+def load_derivative_metadata(derivative_path):
+    metadata_path = derivative_metadata_path(derivative_path)
+    if metadata_path is None:
+        return {}, None
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        return json.load(f), metadata_path
+
+
+def find_matching_derivative_record(target, records):
+    for record in records:
+        if record.field != target.field:
+            continue
+        if (np.isclose(record.k_min_h_mpc, target.k_min_h_mpc,
+                       rtol=1.0e-8, atol=1.0e-12, equal_nan=True)
+                and np.isclose(record.k_max_h_mpc, target.k_max_h_mpc,
+                               rtol=1.0e-8, atol=1.0e-12, equal_nan=True)):
+            return record
+    raise RuntimeError(f'No derivative row matches {target.field}, '
+                       f'k range [{target.k_min_h_mpc}, {target.k_max_h_mpc}].')
+
+
+def merge_derivative_records(inputs):
+    if not inputs:
+        raise RuntimeError('No derivative inputs were loaded.')
+
+    base = inputs[0]
+    merged_records = []
+    parameters = []
+    derivative_kind = base['derivative_kind']
+    for item in inputs:
+        if item['derivative_kind'] != derivative_kind:
+            raise RuntimeError('Cannot combine derivative files with different derivative kinds: '
+                               f"{derivative_kind} and {item['derivative_kind']}.")
+        for parameter in item['parameters']:
+            if parameter in parameters:
+                raise RuntimeError(f'Duplicate derivative parameter: {parameter}')
+            parameters.append(parameter)
+
+    for base_record in base['records']:
+        values = dict(base_record.values)
+        for item in inputs[1:]:
+            record = find_matching_derivative_record(base_record, item['records'])
+            for parameter, value in record.values.items():
+                if parameter in values:
+                    raise RuntimeError(f'Duplicate derivative parameter: {parameter}')
+                values[parameter] = value
+        merged_records.append(DerivativeRecord(
+            field=base_record.field,
+            k_h_mpc=base_record.k_h_mpc,
+            k_min_h_mpc=base_record.k_min_h_mpc,
+            k_max_h_mpc=base_record.k_max_h_mpc,
+            values=values))
+
+    return merged_records, parameters, derivative_kind
+
+
+def load_pipeline_derivatives(args):
+    cosmo_deriv_dir = args.deriv_dir or args.cosmo_deriv_dir
+    inputs = []
+
+    records, parameters, derivative_kind, path = load_derivatives(
+        cosmo_deriv_dir, args.derivatives_file,
+        args.combined_derivatives_file, 'cosmo')
+    metadata, metadata_path = load_derivative_metadata(path)
+    inputs.append({'family': 'cosmo',
+                   'records': records,
+                   'parameters': parameters,
+                   'derivative_kind': derivative_kind,
+                   'path': path,
+                   'metadata': metadata,
+                   'metadata_path': metadata_path})
+
+    if args.include_hod_derivatives:
+        records, parameters, derivative_kind, path = load_derivatives(
+            args.hod_deriv_dir, args.hod_derivatives_file,
+            args.hod_combined_derivatives_file, 'hod')
+        metadata, metadata_path = load_derivative_metadata(path)
+        inputs.append({'family': 'hod',
+                       'records': records,
+                       'parameters': parameters,
+                       'derivative_kind': derivative_kind,
+                       'path': path,
+                       'metadata': metadata,
+                       'metadata_path': metadata_path})
+
+    merged_records, parameters, derivative_kind = merge_derivative_records(inputs)
+    return merged_records, parameters, derivative_kind, inputs
+
+
 def load_components(path):
     rows, _ = read_csv_rows(path)
     components = []
+    seen_fields = set()
     for row in rows:
+        field = row['field']
+        if field in seen_fields:
+            raise RuntimeError(f'Expected one covariance component for {field} in {path}.')
+        seen_fields.add(field)
         components.append(Component(
             component_index=int(row['component_index']),
             global_component_index=int(row.get('global_component_index', row['component_index'])),
-            field=row['field'],
-            k_index=int(row['k_index']),
+            field=field,
             k_h_mpc=float(row['k_h_mpc']),
             k_min_h_mpc=float(row['k_min_h_mpc']),
             k_max_h_mpc=float(row['k_max_h_mpc']),
-            label=row.get('label') or f"{row['field']}_k{int(row['k_index']):03d}"))
+            label=row.get('label') or field))
     return components
 
 
@@ -231,10 +373,14 @@ def derivative_records_by_field(records):
 def find_derivative_record(component, records_by_field):
     candidates = records_by_field.get(component.field, [])
     for record in candidates:
-        if np.isclose(record.k_h_mpc, component.k_h_mpc, rtol=1.0e-8, atol=1.0e-12):
+        if (np.isclose(record.k_min_h_mpc, component.k_min_h_mpc,
+                       rtol=1.0e-8, atol=1.0e-12, equal_nan=True)
+                and np.isclose(record.k_max_h_mpc, component.k_max_h_mpc,
+                               rtol=1.0e-8, atol=1.0e-12, equal_nan=True)):
             return record
     raise RuntimeError(f'No derivative row matches component {component.label} '
-                       f'({component.field}, k={component.k_h_mpc}).')
+                       f'({component.field}, k range '
+                       f'[{component.k_min_h_mpc}, {component.k_max_h_mpc}]).')
 
 
 def build_derivative_matrix(records, components, parameters):
@@ -368,7 +514,7 @@ def write_named_matrix_csv(path, matrix, labels, index_name):
 
 
 def write_derivative_matrix_csv(path, derivative, components, parameters):
-    headers = ['component_index', 'global_component_index', 'field', 'k_index',
+    headers = ['component_index', 'global_component_index', 'field',
                'k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc', 'label']
     headers += [f'dd_d{parameter}' for parameter in parameters]
     with open(path, 'w', newline='', encoding='utf-8') as f:
@@ -378,7 +524,6 @@ def write_derivative_matrix_csv(path, derivative, components, parameters):
             row = [component.component_index,
                    component.global_component_index,
                    component.field,
-                   component.k_index,
                    component.k_h_mpc,
                    component.k_min_h_mpc,
                    component.k_max_h_mpc,
@@ -453,8 +598,8 @@ def main():
     outdir = Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    records, available_parameters, derivative_kind, derivative_path = load_derivatives(
-        args.deriv_dir, args.derivatives_file, args.combined_derivatives_file)
+    records, available_parameters, derivative_kind, derivative_inputs = (
+        load_pipeline_derivatives(args))
     if derivative_kind == 'log' and not args.allow_log_derivatives:
         raise RuntimeError(
             'The derivative file contains logarithmic derivatives (dlnO/dtheta or dlnP/dtheta). '
@@ -464,8 +609,27 @@ def main():
 
     parameters = normalize_params(args.params, available_parameters)
     cov_metadata, cov_metadata_path = load_cov_metadata(args.cov_dir)
+    derivative_paths = {item['family']: str(item['path'])
+                        for item in derivative_inputs}
+    derivative_metadata_paths = {
+        item['family']: str(item['metadata_path']) if item['metadata_path'] else None
+        for item in derivative_inputs}
+    parameter_groups = {
+        'cosmo': [parameter for parameter in parameters
+                  if parameter in PARAMETER_GROUPS['cosmo']],
+        'hod': [parameter for parameter in parameters
+                if parameter in PARAMETER_GROUPS['hod']]}
+    fiducials = {}
+    for item in derivative_inputs:
+        if item['family'] != 'hod':
+            continue
+        hod_metadata = item['metadata'] or {}
+        fiducials['hod'] = {
+            'name': hod_metadata.get('fiducial_hod'),
+            'parameters': hod_metadata.get('fiducial_parameters') or {}}
 
-    print(f'---> derivative file: {derivative_path}')
+    for family, path in derivative_paths.items():
+        print(f'---> {family} derivative file: {path}')
     print(f'---> derivative kind: {derivative_kind}')
     print(f'---> covariance directory: {Path(args.cov_dir).expanduser().resolve()}')
     print(f'---> output directory: {outdir}')
@@ -515,13 +679,19 @@ def main():
 
     metadata_path = outdir / 'fisher_metadata.json'
     outputs['metadata'] = str(metadata_path)
-    metadata = {'derivative_file': str(derivative_path),
+    metadata = {'derivative_file': str(next(iter(derivative_paths.values()))),
+                'derivative_files': derivative_paths,
+                'derivative_metadata_files': derivative_metadata_paths,
                 'derivative_kind': derivative_kind,
                 'covariance_directory': str(Path(args.cov_dir).expanduser().resolve()),
                 'covariance_metadata': str(cov_metadata_path) if cov_metadata_path else None,
                 'outdir': str(outdir),
                 'cases': [case_name(case) for case in cases],
                 'parameters': parameters,
+                'available_parameters': available_parameters,
+                'parameter_groups': parameter_groups,
+                'include_hod_derivatives': args.include_hod_derivatives,
+                'fiducials': fiducials,
                 'inverse_method_requested': args.inverse_method,
                 'rcond': args.rcond,
                 'hartlap_correction': args.hartlap_correction,

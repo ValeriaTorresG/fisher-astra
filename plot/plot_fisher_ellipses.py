@@ -1,31 +1,48 @@
 import argparse, csv, json, os
 from pathlib import Path
-
 import numpy as np
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from matplotlib.patches import Patch
+from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import LinearLocator
+matplotlib.rcParams['text.usetex'] = True
 
 if 'MPLCONFIGDIR' not in os.environ:
     mplconfig = Path(os.environ.get('TMPDIR', '/tmp')) / 'matplotlib-cache'
     mplconfig.mkdir(parents=True, exist_ok=True)
     os.environ['MPLCONFIGDIR'] = str(mplconfig)
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse, Patch
-from matplotlib.ticker import FuncFormatter, LinearLocator
+matplotlib = None
+plt = None
+Ellipse = None
+Patch = None
+FuncFormatter = None
+LinearLocator = None
 
 
-DEFAULT_FISHER_DIR = '/pscratch/sd/v/vtorresg/hod-astra-box500/power_spectra/fisher_cosmo'
+DEFAULT_FISHER_DIR = '/pscratch/sd/v/vtorresg/hod-astra-box500/power_spectra/fisher_cosmo_hod'
 DEFAULT_PARAMS_FILE = 'params/params_cosmo.csv'
+DEFAULT_HOD_PARAMS_FILE = 'params/params_hods_c000_ph000_seed0.csv'
 CASES = ('matter', 'void', 'sheet', 'filament', 'knot', 'combined')
 PARAM_COLUMNS = {'Omega_b': 'omega_b',
                  'omega_cdm': 'omega_cdm',
                  'n_s': 'n_s',
                  'sigma_8m': 'sigma8_m'}
+COSMO_PARAMS = tuple(PARAM_COLUMNS)
+HOD_PARAMS = ('LOGM_CUT', 'LOGM1', 'SIGMA', 'ALPHA', 'KAPPA')
 PARAM_LABELS = {'Omega_b': r'$\omega_b$',
                 'omega_cdm': r'$\omega_{\rm cdm}$',
                 'n_s': r'$n_s$',
-                'sigma_8m': r'$\sigma_8$'}
+                'sigma_8m': r'$\sigma_8$',
+                'LOGM_CUT': r'$\log M_{\rm cut}$',
+                'LOGM1': r'$\log M_1$',
+                'SIGMA': r'$\sigma$',
+                'ALPHA': r'$\alpha$',
+                'KAPPA': r'$\kappa$'}
 CASE_LABELS = {'matter': r'$P_{\rm matter}$',
                'void': r'$P_{\rm void}$',
                'sheet': r'$P_{\rm sheet}$',
@@ -41,27 +58,35 @@ CASE_STYLES = {'matter': {'color': 'black', 'lw': 2.8},
 DEFAULT_TICK_DECIMALS = {'Omega_b': 4,
                          'omega_cdm': 3,
                          'n_s': 3,
-                         'sigma_8m': 3}
+                         'sigma_8m': 3,
+                         'LOGM_CUT': 3,
+                         'LOGM1': 3,
+                         'SIGMA': 3,
+                         'ALPHA': 3,
+                         'KAPPA': 3}
+PARAM_ALIASES = {'omega_b': 'Omega_b',
+                 'Omega_b': 'Omega_b',
+                 'omega_cdm': 'omega_cdm',
+                 'n_s': 'n_s',
+                 'sigma_8m': 'sigma_8m',
+                 'sigma8_m': 'sigma_8m'}
+PARAM_ALIASES.update({parameter.lower(): parameter for parameter in HOD_PARAMS})
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--fisher-dir', type=str, default=DEFAULT_FISHER_DIR)
     parser.add_argument('--params-file', type=str, default=DEFAULT_PARAMS_FILE)
+    parser.add_argument('--hod-params-file', type=str, default=DEFAULT_HOD_PARAMS_FILE)
     parser.add_argument('--cosmo', type=str, default='c000')
+    parser.add_argument('--fiducial-hod', type=str, default='')
     parser.add_argument('--params', nargs='+', default=['all'])
-    parser.add_argument('--cases', nargs='+', default=['all'],
-                        choices=list(CASES) + ['each'])
+    parser.add_argument('--cases', nargs='+', default=['all'], choices=list(CASES) + ['each'])
     parser.add_argument('--out', type=str, default='')
     parser.add_argument('--dpi', type=int, default=360)
     parser.add_argument('--range-sigma', type=float, default=2.0)
     parser.add_argument('--show', action='store_true')
     return parser.parse_args()
-
-
-def setup_matplotlib():
-    # plt.style.use('dark_background')
-    matplotlib.rcParams['text.usetex'] = True
 
 
 def normalize_cosmo(value):
@@ -73,6 +98,13 @@ def normalize_cosmo(value):
     if value.startswith('c'):
         return f'c{int(value[1:]):03d}'
     return f'c{int(value):03d}'
+
+
+def normalize_hod(value):
+    value = str(value).strip().lower()
+    if value.startswith('hod'):
+        value = value[3:]
+    return f'hod{int(value):03d}'
 
 
 def normalize_cases(values):
@@ -94,19 +126,70 @@ def load_fisher_metadata(fisher_dir):
 
 
 def normalize_params(values, metadata):
-    available = metadata.get('parameters') or list(PARAM_COLUMNS)
+    available = metadata.get('parameters') or list(COSMO_PARAMS)
     if any(value == 'all' for value in values):
         return list(available)
-    missing = [value for value in values if value not in available]
-    if missing:
-        raise RuntimeError(f'Parameters not available: {", ".join(missing)}. '
-                           f'Available: {", ".join(available)}')
-    return list(values)
+    params = []
+    for value in values:
+        token = str(value).strip()
+        token_lower = token.lower()
+        if token_lower in ('cosmo', 'cosmology', 'cosmological'):
+            expanded = [parameter for parameter in COSMO_PARAMS
+                        if parameter in available]
+        elif token_lower == 'hod':
+            expanded = [parameter for parameter in HOD_PARAMS
+                        if parameter in available]
+        else:
+            expanded = [PARAM_ALIASES.get(token, PARAM_ALIASES.get(token_lower, token))]
+        for parameter in expanded:
+            if parameter not in available:
+                raise RuntimeError(f'Parameter {parameter} is not available. '
+                                   f'Available: {", ".join(available)}')
+            if parameter not in params:
+                params.append(parameter)
+    return params
 
 
 def parameter_indices(parameters, metadata):
-    available = metadata.get('parameters') or list(PARAM_COLUMNS)
+    available = metadata.get('parameters') or list(COSMO_PARAMS)
     return [available.index(parameter) for parameter in parameters]
+
+
+def parameters_from_group(metadata, group):
+    groups = metadata.get('parameter_groups') or {}
+    if group in groups and groups[group]:
+        return list(groups[group])
+    available = metadata.get('parameters') or list(COSMO_PARAMS)
+    if group == 'cosmo':
+        return [parameter for parameter in COSMO_PARAMS if parameter in available]
+    if group == 'hod':
+        return [parameter for parameter in HOD_PARAMS if parameter in available]
+    raise ValueError(f'Unknown parameter group: {group}')
+
+
+def plot_specs_from_args(values, metadata):
+    tokens = [str(value).strip().lower() for value in values]
+    if any(token == 'all' for token in tokens):
+        specs = []
+        for group in ('cosmo', 'hod'):
+            params = parameters_from_group(metadata, group)
+            if params:
+                specs.append((group, params))
+        if specs:
+            return specs
+        return [('all', normalize_params(values, metadata))]
+
+    if tokens and all(token in ('cosmo', 'cosmology', 'cosmological', 'hod')
+                      for token in tokens):
+        specs = []
+        for token in tokens:
+            group = 'cosmo' if token in ('cosmo', 'cosmology', 'cosmological') else 'hod'
+            params = parameters_from_group(metadata, group)
+            if params:
+                specs.append((group, params))
+        return specs
+
+    return [('custom', normalize_params(values, metadata))]
 
 
 def load_parameter_covariances(fisher_dir, cases, indices):
@@ -123,7 +206,7 @@ def load_parameter_covariances(fisher_dir, cases, indices):
     return covariances
 
 
-def load_fiducial_values(params_file, cosmo, parameters):
+def load_cosmo_fiducial_values(params_file, cosmo, parameters):
     target = normalize_cosmo(cosmo)
     with open(params_file, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f, skipinitialspace=True)
@@ -140,6 +223,68 @@ def load_fiducial_values(params_file, cosmo, parameters):
                     values.append(float(row[column]))
                 return np.asarray(values, dtype=np.float64)
     raise RuntimeError(f'Fiducial cosmology {cosmo} not found in {params_file}.')
+
+
+def fiducial_hod_from_metadata(metadata, requested):
+    if requested:
+        return normalize_hod(requested)
+    fiducials = metadata.get('fiducials') or {}
+    hod_info = fiducials.get('hod') or {}
+    name = hod_info.get('name')
+    if name:
+        return normalize_hod(name)
+    return 'hod000'
+
+
+def load_hod_fiducial_values(params_file, fiducial_hod, parameters, metadata):
+    fiducial_hod = normalize_hod(fiducial_hod)
+    fiducials = metadata.get('fiducials') or {}
+    hod_info = fiducials.get('hod') or {}
+    metadata_values = hod_info.get('parameters') or {}
+    if metadata_values and all(parameter in metadata_values for parameter in parameters):
+        return np.asarray([float(metadata_values[parameter])
+                           for parameter in parameters],
+                          dtype=np.float64)
+
+    with open(params_file, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f, skipinitialspace=True)
+        for raw_row in reader:
+            row = {key.strip(): str(value).strip() if value is not None else ''
+                   for key, value in raw_row.items() if key is not None}
+            hod_value = row.get('hod') or row.get('filename', '').replace('.fits', '')
+            if hod_value and normalize_hod(hod_value) == fiducial_hod:
+                values = []
+                for parameter in parameters:
+                    if parameter not in row:
+                        raise RuntimeError(f'Missing HOD fiducial column {parameter}.')
+                    values.append(float(row[parameter]))
+                return np.asarray(values, dtype=np.float64)
+    raise RuntimeError(f'Fiducial HOD {fiducial_hod} not found in {params_file}.')
+
+
+def load_fiducial_values(params_file, hod_params_file, cosmo, fiducial_hod,
+                         parameters, metadata):
+    values = []
+    cosmo_params = [parameter for parameter in parameters if parameter in COSMO_PARAMS]
+    hod_params = [parameter for parameter in parameters if parameter in HOD_PARAMS]
+    cosmo_values = {}
+    hod_values = {}
+    if cosmo_params:
+        loaded = load_cosmo_fiducial_values(params_file, cosmo, cosmo_params)
+        cosmo_values = dict(zip(cosmo_params, loaded))
+    if hod_params:
+        loaded = load_hod_fiducial_values(
+            hod_params_file, fiducial_hod, hod_params, metadata)
+        hod_values = dict(zip(hod_params, loaded))
+
+    for parameter in parameters:
+        if parameter in cosmo_values:
+            values.append(cosmo_values[parameter])
+        elif parameter in hod_values:
+            values.append(hod_values[parameter])
+        else:
+            raise RuntimeError(f'No fiducial value loader for parameter {parameter}.')
+    return np.asarray(values, dtype=np.float64)
 
 
 def tick_decimals_for_params(parameters):
@@ -233,7 +378,7 @@ def plot_triangle(covariances, theta_fid, parameters, cases, out, dpi, range_sig
                 ax.set_xlim(*xlim)
                 ax.set_ylim(0.0, 1.1)
                 ax.set_yticks([])
-                ax.grid(alpha=0.3, lw=0.3)
+                ax.grid(alpha=0.6, lw=0.3)
             else:
                 i = row
                 j = col
@@ -253,12 +398,12 @@ def plot_triangle(covariances, theta_fid, parameters, cases, out, dpi, range_sig
                             theta_fid[j] + range_sigma * limit_sigmas[j])
                 ax.set_ylim(theta_fid[i] - range_sigma * limit_sigmas[i],
                             theta_fid[i] + range_sigma * limit_sigmas[i])
-                ax.grid(alpha=0.3, lw=0.3)
+                ax.grid(alpha=1.0, lw=0.3)
 
             if row == npar - 1:
-                ax.set_xlabel(labels[col], fontsize=17)
+                ax.set_xlabel(labels[col], fontsize=20)
             if col == 0 and row > 0:
-                ax.set_ylabel(labels[row], fontsize=17)
+                ax.set_ylabel(labels[row], fontsize=20)
             ax.tick_params(axis='both', labelsize=14)
 
     for row in range(npar):
@@ -293,43 +438,60 @@ def plot_triangle(covariances, theta_fid, parameters, cases, out, dpi, range_sig
     if legend_handles:
         fig.legend(legend_handles, legend_labels, loc='upper left',
                    bbox_to_anchor=(0.76, 0.86), ncol=1, frameon=False,
-                   fontsize=17, handlelength=2.7, handleheight=1.1,
+                   fontsize=20, handlelength=2.7, handleheight=1.1,
                    labelspacing=0.8, handletextpad=0.9, borderaxespad=0.0)
     fig.savefig(out, dpi=dpi, bbox_inches='tight')
     return fig
 
 
+def output_path_for_spec(args_out, fisher_dir, spec_name, multiple):
+    if args_out:
+        out = Path(args_out).expanduser().resolve()
+        if multiple:
+            suffix = out.suffix or '.png'
+            return out.with_name(f'{out.stem}_{spec_name}{suffix}')
+        return out
+    if spec_name in ('cosmo', 'hod'):
+        return fisher_dir / f'conf_ellip_{spec_name}.png'
+    return fisher_dir / 'conf_ellip_envs.png'
+
+
 def main():
     args = parse_args()
-    setup_matplotlib()
     fisher_dir = Path(args.fisher_dir).expanduser().resolve()
     metadata, metadata_path = load_fisher_metadata(fisher_dir)
     cases = normalize_cases(args.cases)
-    parameters = normalize_params(args.params, metadata)
-    indices = parameter_indices(parameters, metadata)
-    theta_fid = load_fiducial_values(Path(args.params_file).expanduser().resolve(),
-                                     args.cosmo, parameters)
-    covariances = load_parameter_covariances(fisher_dir, cases, indices)
-
-    if args.out:
-        out = Path(args.out).expanduser().resolve()
-    else:
-        out = fisher_dir / 'conf_ellip_envs.png'
-    out.parent.mkdir(parents=True, exist_ok=True)
+    specs = plot_specs_from_args(args.params, metadata)
+    fiducial_hod = fiducial_hod_from_metadata(metadata, args.fiducial_hod)
 
     print(f'---> fisher directory: {fisher_dir}')
     if metadata_path:
         print(f'---> metadata: {metadata_path}')
     print(f'---> cases: {cases}')
-    print(f'---> parameters: {parameters}')
-    print(f'---> fiducial theta: {theta_fid}')
+    print(f'---> fiducial HOD: {fiducial_hod}')
 
-    fig = plot_triangle(covariances, theta_fid, parameters, cases,
-                        out, args.dpi, args.range_sigma)
-    print(f'---> wrote: {out}')
-    if args.show:
-        plt.show()
-    plt.close(fig)
+    multiple = len(specs) > 1
+    for spec_name, parameters in specs:
+        if len(parameters) < 1:
+            continue
+        indices = parameter_indices(parameters, metadata)
+        theta_fid = load_fiducial_values(
+            Path(args.params_file).expanduser().resolve(),
+            Path(args.hod_params_file).expanduser().resolve(),
+            args.cosmo, fiducial_hod, parameters, metadata)
+        covariances = load_parameter_covariances(fisher_dir, cases, indices)
+        out = output_path_for_spec(args.out, fisher_dir, spec_name, multiple)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        print(f'---> plot group: {spec_name}')
+        print(f'---> parameters: {parameters}')
+        print(f'---> fiducial theta: {theta_fid}')
+        fig = plot_triangle(covariances, theta_fid, parameters, cases,
+                            out, args.dpi, args.range_sigma)
+        print(f'---> wrote: {out}')
+        if args.show:
+            plt.show()
+        plt.close(fig)
 
 
 if __name__ == '__main__':

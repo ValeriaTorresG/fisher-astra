@@ -4,9 +4,18 @@ from pathlib import Path
 import numpy as np
 
 
-DEFAULT_FISHER_DIR = '/pscratch/sd/v/vtorresg/hod-astra-box500/power_spectra/fisher_cosmo'
+DEFAULT_FISHER_DIR = '/pscratch/sd/v/vtorresg/hod-astra-box500/power_spectra/fisher_cosmo_hod'
 ENV_CASES = ('matter', 'void', 'sheet', 'filament', 'knot', 'combined')
-DEFAULT_PARAMS = ('Omega_b', 'omega_cdm', 'n_s', 'sigma_8m')
+COSMO_PARAMS = ('Omega_b', 'omega_cdm', 'n_s', 'sigma_8m')
+HOD_PARAMS = ('LOGM_CUT', 'LOGM1', 'SIGMA', 'ALPHA', 'KAPPA')
+DEFAULT_PARAMS = COSMO_PARAMS + HOD_PARAMS
+PARAM_ALIASES = {'omega_b': 'Omega_b',
+                 'Omega_b': 'Omega_b',
+                 'omega_cdm': 'omega_cdm',
+                 'n_s': 'n_s',
+                 'sigma_8m': 'sigma_8m',
+                 'sigma8_m': 'sigma_8m'}
+PARAM_ALIASES.update({parameter.lower(): parameter for parameter in HOD_PARAMS})
 
 
 def parse_args():
@@ -40,7 +49,25 @@ def normalize_params(values, metadata):
     available = metadata.get('parameters') or list(DEFAULT_PARAMS)
     if any(value == 'all' for value in values):
         return list(available)
-    return list(values)
+    params = []
+    for value in values:
+        token = str(value).strip()
+        token_lower = token.lower()
+        if token_lower in ('cosmo', 'cosmology', 'cosmological'):
+            expanded = [parameter for parameter in COSMO_PARAMS
+                        if parameter in available]
+        elif token_lower == 'hod':
+            expanded = [parameter for parameter in HOD_PARAMS
+                        if parameter in available]
+        else:
+            expanded = [PARAM_ALIASES.get(token, PARAM_ALIASES.get(token_lower, token))]
+        for parameter in expanded:
+            if parameter not in available:
+                raise RuntimeError(f'Parameter {parameter} is not available. '
+                                   f'Available: {", ".join(available)}')
+            if parameter not in params:
+                params.append(parameter)
+    return params
 
 
 def parameter_indices(parameters, metadata):

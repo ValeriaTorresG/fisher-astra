@@ -9,7 +9,6 @@ from pypower import CatalogFFTPower
 
 DEFAULT_DATA_ROOT = '/pscratch/sd/v/vtorresg/hod-astra-box500'
 DEFAULT_KMAX = 0.5
-DEFAULT_K_BIN_WIDTH_FACTOR = 2.0
 ENVIRONMENTS = ('void', 'sheet', 'filament', 'knot')
 PROB_COLS = {'void': 'PVOID',
              'sheet': 'PSHEET',
@@ -37,7 +36,7 @@ def parse_args():
     parser.add_argument('--prob-file', type=str, default='')
     parser.add_argument('--cosmo', nargs='+', default=['all'])
     parser.add_argument('--hod', nargs='+', default=['all'])
-    parser.add_argument('--field', type=str, default='matter', choices=['matter', 'all'] + list(ENVIRONMENTS))
+    parser.add_argument('--field', type=str, default='all', choices=['matter', 'all'] + list(ENVIRONMENTS))
     parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--boxsize', type=float, default=500.0)
     parser.add_argument('--boxcenter', nargs=3, type=float, default=[0.0, 0.0, 0.0])
@@ -50,7 +49,6 @@ def parse_args():
     parser.add_argument('--data-randiter', type=int, default=-1)
     parser.add_argument('--use-all-rows', action='store_true')
     parser.add_argument('--subtract-shotnoise', action='store_true')
-    parser.add_argument('--k-bin-width', type=float, default=0.0)
     parser.add_argument('--kmax', type=float, default=DEFAULT_KMAX)
     parser.add_argument('--unmatched-policy', type=str, default='error', choices=['error', 'drop'])
     parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=True)
@@ -279,8 +277,8 @@ def mas_to_resampler(mas):
     return mapping[mas.upper()]
 
 
-def make_k_edges(boxsize, nmesh, k_bin_width, kmax):
-    """Return fixed k-bin edges shared by every P(k) for one catalog."""
+def make_k_range_edges(boxsize, nmesh, kmax):
+    """Return the single k interval used for the range-integrated observable."""
     boxsize = float(boxsize)
     nmesh = int(nmesh)
     if boxsize <= 0.0:
@@ -288,43 +286,24 @@ def make_k_edges(boxsize, nmesh, k_bin_width, kmax):
     if nmesh <= 0:
         raise ValueError(f'nmesh must be positive, got {nmesh}.')
 
-    k_fundamental = 2.0 * np.pi / boxsize
-    dk = DEFAULT_K_BIN_WIDTH_FACTOR * k_fundamental if k_bin_width <= 0.0 else float(k_bin_width)
-    if not np.isfinite(dk) or dk <= 0.0:
-        raise ValueError(f'k-bin width must be positive, got {dk}.')
-
     k_nyquist = np.pi * float(nmesh) / boxsize
     k_stop = k_nyquist if kmax <= 0.0 else min(float(kmax), k_nyquist)
     if not np.isfinite(k_stop) or k_stop <= 0.0:
         raise ValueError(f'kmax must define a positive k range, got {kmax}.')
-
-    n_bins = max(1, int(np.ceil(k_stop / dk - 1.0e-12)))
-    edges = dk * np.arange(n_bins + 1, dtype=np.float64)
-    return edges
+    return np.asarray([0.0, k_stop], dtype=np.float64)
 
 
-def k_binning_metadata(edges, boxsize, nmesh, requested_k_bin_width, requested_kmax):
+def k_range_metadata(edges, boxsize, nmesh, requested_kmax):
     edges = np.asarray(edges, dtype=np.float64)
-    widths = np.diff(edges)
     k_fundamental = 2.0 * np.pi / float(boxsize)
     k_nyquist = np.pi * float(nmesh) / float(boxsize)
     target_kmax = float(requested_kmax)
-    if widths.size:
-        binning_kmax = target_kmax if target_kmax > 0.0 else k_nyquist
-        nominal_n_bins = binning_kmax / widths[0]
-    else:
-        nominal_n_bins = np.nan
     return {'fundamental_mode_h_mpc': float(k_fundamental),
-            'delta_k_h_mpc': float(widths[0]) if widths.size else np.nan,
-            'delta_k_over_k_fundamental': float(widths[0] / k_fundamental) if widths.size else np.nan,
-            'binning_rule': 'Delta k = 2 * k_fundamental = 4*pi/boxsize',
-            'nominal_n_bins_target_kmax_over_delta_k': float(nominal_n_bins) if widths.size else np.nan,
-            'n_bins': int(widths.size),
-            'k_min_edge_h_mpc': float(edges[0]) if edges.size else np.nan,
-            'k_max_edge_h_mpc': float(edges[-1]) if edges.size else np.nan,
+            'k_min_h_mpc': float(edges[0]) if edges.size else np.nan,
+            'k_max_h_mpc': float(edges[-1]) if edges.size else np.nan,
             'target_kmax_h_mpc': target_kmax,
             'nyquist_h_mpc': float(k_nyquist),
-            'requested_k_bin_width_h_mpc': float(requested_k_bin_width)}
+            'definition': 'single P(k) observable over the full requested k range'}
 
 
 def to_scalar_float(value, default=np.nan):
@@ -357,10 +336,10 @@ def extract_monopole(poles):
             'remove_shotnoise_supported': remove_shotnoise_supported}
 
 
-def compute_pk_pypower(positions, weights, edges, args):
+def compute_pk_pypower(positions, weights, k_edges, args):
     result = CatalogFFTPower(data_positions1=positions,
                              data_weights1=weights,
-                             edges=edges,
+                             edges=k_edges,
                              ells=(0,),
                              position_type='pos',
                              boxsize=args.boxsize,
@@ -425,11 +404,11 @@ def rfft_mode_weights(nmesh):
     return weights
 
 
-def compute_pk(positions, weights, edges, args):
+def compute_pk(positions, weights, k_edges, args):
     if positions.shape[0] == 0:
         raise RuntimeError('Cannot compute P(k): selected field has zero galaxies.')
-    result = compute_pk_pypower(positions, weights, edges, args)
-    result['k_edges'] = np.asarray(edges, dtype=np.float64).copy()
+    result = compute_pk_pypower(positions, weights, k_edges, args)
+    result['k_range_edges'] = np.asarray(k_edges, dtype=np.float64).copy()
 
     volume = float(args.boxsize) ** 3
     sw = float(np.sum(weights, dtype=np.float64))
@@ -465,10 +444,10 @@ def write_csv(path, results):
     fields = list(results)
     first = results[fields[0]]
     k = first['k']
-    k_edges = np.asarray(first.get('k_edges', []), dtype=np.float64)
-    if k_edges.size == k.size + 1:
-        k_min = k_edges[:-1]
-        k_max = k_edges[1:]
+    k_range_edges = np.asarray(first.get('k_range_edges', []), dtype=np.float64)
+    if k_range_edges.size == 2 and k.size == 1:
+        k_min = np.asarray([k_range_edges[0]], dtype=np.float64)
+        k_max = np.asarray([k_range_edges[1]], dtype=np.float64)
     else:
         k_min = np.full_like(k, np.nan, dtype=np.float64)
         k_max = np.full_like(k, np.nan, dtype=np.float64)
@@ -476,8 +455,13 @@ def write_csv(path, results):
     headers = ['k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc', 'nmodes']
     for field in fields:
         result = results[field]
-        cols.append(align_to_k(k, result['k'], result['pk_raw']))
-        cols.append(align_to_k(k, result['k'], result['pk_used']))
+        pk_raw = np.asarray(result['pk_raw'], dtype=np.float64)
+        pk_used = np.asarray(result['pk_used'], dtype=np.float64)
+        if pk_raw.shape != k.shape or pk_used.shape != k.shape:
+            raise RuntimeError(f'Unexpected P(k) shape for {field}: '
+                               f'{pk_raw.shape}, {pk_used.shape}; expected {k.shape}.')
+        cols.append(pk_raw)
+        cols.append(pk_used)
         headers.append(f'pk_raw_{field}')
         headers.append(f'pk_used_{field}')
     np.savetxt(path, np.column_stack(cols), delimiter=',',
@@ -511,7 +495,7 @@ def write_plot(path, results, title):
         pk = result['pk_used']
         mask = (k > 0.0) & np.isfinite(pk) & (pk > 0.0)
         if np.any(mask):
-            ax.loglog(k[mask], pk[mask], lw=1.5, label=field)
+            ax.loglog(k[mask], pk[mask], marker='o', lw=1.5, label=field)
     ax.set_xlabel(r'$k\ [h\,\mathrm{Mpc}^{-1}]$')
     ax.set_ylabel(r'$P(k)\ [(\mathrm{Mpc}/h)^3]$')
     ax.grid(alpha=0.3, which='both')
@@ -558,12 +542,11 @@ def process_job(job, args, outdir):
             raw['targetid'], job.probability_path, args.unmatched_policy)
         print(f"---> {job.tag}: ASTRA class counts {class_info['class_counts']}")
 
-    edges = make_k_edges(args.boxsize, args.grid, args.k_bin_width, args.kmax)
-    binning = k_binning_metadata(edges, args.boxsize, args.grid, args.k_bin_width, args.kmax)
-    print("---> k-binning: "
-          f"{binning['n_bins']} bins, "
-          f"Delta k = {binning['delta_k_h_mpc']:.8f} h/Mpc, "
-          f"kmax edge = {binning['k_max_edge_h_mpc']:.8f} h/Mpc")
+    k_edges = make_k_range_edges(args.boxsize, args.grid, args.kmax)
+    k_range = k_range_metadata(k_edges, args.boxsize, args.grid, args.kmax)
+    print("---> k range: "
+          f"{k_range['k_min_h_mpc']:.8f} <= k <= "
+          f"{k_range['k_max_h_mpc']:.8f} h/Mpc")
     positions = raw['positions']
     weights = raw['weights']
     results = {}
@@ -583,7 +566,7 @@ def process_job(job, args, outdir):
             raise RuntimeError(f'{job.tag}: field {field} has zero selected galaxies.')
 
         print(f'---> {job.tag}: computing {field} P(k) with {n_field} galaxies')
-        results[field] = compute_pk(positions[field_mask], weights[field_mask], edges, args)
+        results[field] = compute_pk(positions[field_mask], weights[field_mask], k_edges, args)
         field_info[field] = {'mark': mark_desc,
                              'n_selected': n_field,
                              'selected_fraction': float(n_field / positions.shape[0])}
@@ -616,9 +599,8 @@ def process_job(job, args, outdir):
                 'interlacing': args.interlacing,
                 'engine_requested': args.engine,
                 'subtract_shotnoise': args.subtract_shotnoise,
-                'k_bin_width': args.k_bin_width,
                 'kmax': args.kmax,
-                'binning': binning,
+                'k_range': k_range,
                 'outputs': {'csv': str(csv_path),
                             'metadata': str(meta_path),
                             'plot': str(plot_path) if plot_written else None}}
