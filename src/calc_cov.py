@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from calc_deriv_cosmo import (DEFAULT_PK_ROOT, ENVIRONMENT_FIELDS,
+from calc_deriv_cosmo import (DEFAULT_PK_ROOT, ENVIRONMENT_FIELDS, FIELDS,
                               OBSERVABLE_KINDS, add_bool_argument,
                               align_pk_to_reference, load_pk_csv,
                               normalize_cosmo, normalize_hod,
@@ -12,7 +12,7 @@ from calc_deriv_cosmo import (DEFAULT_PK_ROOT, ENVIRONMENT_FIELDS,
 
 
 DEFAULT_COSMO = 'c000'
-DEFAULT_FIELDS = list(ENVIRONMENT_FIELDS)
+DEFAULT_FIELDS = list(FIELDS)
 PK_KINDS = ('pk_used', 'pk_raw')
 
 Component = SimpleNamespace
@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--cosmo', type=str, default=DEFAULT_COSMO)
     parser.add_argument('--fields', nargs='+', default=['all'],
-                        choices=['all'] + list(ENVIRONMENT_FIELDS))
+                        choices=['all'] + list(FIELDS))
     parser.add_argument('--hod', nargs='+', default=['all'])
     parser.add_argument('--pk-kind', type=str, default='pk_used', choices=PK_KINDS)
     parser.add_argument('--observable', type=str, default='f2pk', choices=OBSERVABLE_KINDS)
@@ -41,9 +41,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def normalize_environment_fields(values):
+def normalize_fields(values):
     if any(value == 'all' for value in values):
-        return list(ENVIRONMENT_FIELDS)
+        return list(FIELDS)
     fields = []
     for value in values:
         if value not in fields:
@@ -369,7 +369,7 @@ def main():
     args = parse_args()
     t0 = time.time()
 
-    fields = normalize_environment_fields(args.fields)
+    fields = normalize_fields(args.fields)
     hod_filter = normalize_hod_filter(args.hod)
     cosmo = normalize_cosmo(args.cosmo)
     pk_root = Path(args.pk_root).expanduser().resolve()
@@ -401,15 +401,11 @@ def main():
     print(f'---> finite mocks used: {n_samples}')
     if dropped:
         print(f'---> dropped non-finite mocks: {len(dropped)}')
-    print(f'---> combined vector length: {n_components} '
+    print(f'---> loaded vector length: {n_components} '
           f'({len(fields)} fields x {n_k} k bins)')
 
     products = {}
     diagnostics = {}
-    products['all'] = write_covariance_product(outdir, 'all', mean_all,
-                                               cov_all, components)
-    diagnostics['all'] = matrix_diagnostics(cov_all, n_samples, args.ddof)
-
     field_slice_metadata = {}
     for field, slc in slices.items():
         indices = np.arange(slc.start, slc.stop)
@@ -422,6 +418,25 @@ def main():
         field_slice_metadata[field] = {'start': int(slc.start),
                                        'stop': int(slc.stop),
                                        'n_components': int(slc.stop - slc.start)}
+
+    if all(field in slices for field in ENVIRONMENT_FIELDS):
+        env_indices = np.concatenate(
+            [np.arange(slices[field].start, slices[field].stop)
+             for field in ENVIRONMENT_FIELDS])
+        combined_components = subset_components(components, env_indices)
+        combined_mean = mean_all[env_indices]
+        combined_cov = cov_all[np.ix_(env_indices, env_indices)]
+        products['combined'] = write_covariance_product(
+            outdir, 'combined', combined_mean, combined_cov, combined_components)
+        diagnostics['combined'] = matrix_diagnostics(combined_cov, n_samples, args.ddof)
+        field_slice_metadata['combined'] = {'fields': list(ENVIRONMENT_FIELDS),
+                                            'global_component_indices': env_indices.astype(int).tolist(),
+                                            'n_components': int(env_indices.size)}
+
+        products['all'] = write_covariance_product(
+            outdir, 'all', combined_mean, combined_cov, combined_components)
+        diagnostics['all'] = diagnostics['combined']
+        field_slice_metadata['all'] = field_slice_metadata['combined']
 
     samples_path = outdir / 'samples.csv'
     write_samples_csv(samples_path, samples)
@@ -444,16 +459,17 @@ def main():
                'fields': fields,
                'observable': args.observable,
                'n_samples': n_samples,
-               'n_components_all': n_components,
+               'n_components_loaded': n_components,
                'outputs': products}
     summary_path = outdir / f'cov_summary_{int(time.time())}.json'
     with open(summary_path, 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=2)
 
-    print(f'---> wrote: {products["all"]["covariance_csv"]}')
-    print(f'---> wrote: {products["all"]["covariance_npy"]}')
     for field in fields:
         print(f'---> wrote: {products[field]["covariance_csv"]}')
+    if 'combined' in products:
+        print(f'---> wrote: {products["combined"]["covariance_csv"]}')
+        print(f'---> wrote alias: {products["all"]["covariance_csv"]}')
     print(f'---> wrote: {metadata_path}')
     print(f'---> wrote: {summary_path}')
     print(f"---> elapsed: {summary['elapsed_sec']:.2f} s")

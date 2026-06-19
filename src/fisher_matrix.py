@@ -4,11 +4,12 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from calc_deriv_cosmo import (DEFAULT_PK_ROOT, ENVIRONMENT_FIELDS,
+from calc_deriv_cosmo import (DEFAULT_PK_ROOT, ENVIRONMENT_FIELDS, FIELDS,
                               PARAM_ALIASES, PARAM_SPECS)
 
 
-CASE_CHOICES = tuple(ENVIRONMENT_FIELDS) + ('combined', 'all')
+DATA_FIELDS = tuple(FIELDS)
+CASE_CHOICES = DATA_FIELDS + ('combined', 'all')
 DERIVATIVE_PREFIXES = ('dO_d', 'dpk_d', 'dlnO_d', 'dlnpk_d')
 LOG_PREFIXES = ('dlnO_d', 'dlnpk_d')
 DerivativeRecord = SimpleNamespace
@@ -37,7 +38,7 @@ def parse_args():
 
 def normalize_cases(values):
     if 'all' in values:
-        return list(ENVIRONMENT_FIELDS) + ['combined']
+        return list(DATA_FIELDS) + ['combined']
     cases = []
     for value in values:
         if value not in cases:
@@ -46,7 +47,7 @@ def normalize_cases(values):
 
 
 def case_name(case):
-    return 'all' if case == 'combined' else case
+    return case
 
 
 def normalize_params(values, available):
@@ -75,7 +76,7 @@ def derivative_column_info(column):
 
 
 def split_field_derivative_column(column):
-    for field in ENVIRONMENT_FIELDS:
+    for field in DATA_FIELDS:
         suffix = f'_{field}'
         if not column.endswith(suffix):
             continue
@@ -123,10 +124,10 @@ def load_combined_derivatives(path):
         raise RuntimeError(f'Mixed derivative kinds found in {path}: {sorted(derivative_kinds)}')
 
     records = []
-    field_counts = {field: 0 for field in ENVIRONMENT_FIELDS}
+    field_counts = {field: 0 for field in DATA_FIELDS}
     for row in rows:
         field = row.get('field', '').strip()
-        if field not in ENVIRONMENT_FIELDS:
+        if field not in DATA_FIELDS:
             continue
         k_index = field_counts[field]
         field_counts[field] += 1
@@ -167,7 +168,7 @@ def load_matrix_derivatives(path):
         raise RuntimeError(f'Mixed derivative kinds found in {path}: {sorted(derivative_kinds)}')
 
     records = []
-    for field in [item for item in ENVIRONMENT_FIELDS if item in fields]:
+    for field in [item for item in DATA_FIELDS if item in fields]:
         for k_index, row in enumerate(rows):
             values = {}
             for parameter in parameters:
@@ -194,12 +195,12 @@ def load_derivatives(deriv_dir, derivatives_file, combined_derivatives_file):
                    if derivatives_file
                    else deriv_dir / 'deriv_cosmo.csv')
 
-    if combined_path.is_file():
-        records, parameters, derivative_kind = load_combined_derivatives(combined_path)
-        return records, parameters, derivative_kind, combined_path
     if matrix_path.is_file():
         records, parameters, derivative_kind = load_matrix_derivatives(matrix_path)
         return records, parameters, derivative_kind, matrix_path
+    if combined_path.is_file():
+        records, parameters, derivative_kind = load_combined_derivatives(combined_path)
+        return records, parameters, derivative_kind, combined_path
 
     raise RuntimeError(f'Cannot find derivative inputs. Tried {combined_path} and {matrix_path}.')
 
@@ -257,6 +258,10 @@ def load_covariance_inputs(cov_dir, case):
     name = case_name(case)
     cov_path = cov_dir / f'cov_{name}.npy'
     components_path = cov_dir / f'components_{name}.csv'
+    if case == 'combined' and not cov_path.is_file():
+        cov_path = cov_dir / 'cov_all.npy'
+    if case == 'combined' and not components_path.is_file():
+        components_path = cov_dir / 'components_all.csv'
     if not cov_path.is_file():
         raise RuntimeError(f'Missing covariance file: {cov_path}')
     if not components_path.is_file():
@@ -310,7 +315,7 @@ def hartlap_factor_from_metadata(metadata, name):
 
 def fisher_from_derivatives(derivative, precision):
     fisher = derivative.T @ precision @ derivative
-    return 0.5 * (fisher + fisher.T)
+    return 0.5 * (fisher + fisher.T) #!make sure the matrix is exactly symmetric to avoid errors
 
 
 def parameter_covariance_from_fisher(fisher, rcond):
