@@ -6,9 +6,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from calc_deriv_cosmo import (DEFAULT_PK_ROOT, DERIVATIVE_KINDS,
-                              FIELDS, OBSERVABLE_KINDS,
+                              FIELDS, FIELD_CHOICES, OBSERVABLE_KINDS,
+                              RANDOM_VOID_FIELD,
                               add_bool_argument, align_pk_to_reference,
-                              average_pk, check_result_k_range,
+                              average_pk, check_result_bins,
                               derivative_axis_label,
                               normalize_cosmo, normalize_fields,
                               normalize_hod, observable_description,
@@ -39,12 +40,12 @@ def parse_args():
     parser.add_argument('--params-file', type=str, default=DEFAULT_PARAMS_FILE)
     parser.add_argument('--hod-header-dir', type=str, default=DEFAULT_HOD_HEADER_DIR)
     parser.add_argument('--outdir', type=str, default='')
-    parser.add_argument('--fields', nargs='+', default=['all'], choices=['all'] + list(FIELDS))
+    parser.add_argument('--fields', nargs='+', default=['all'], choices=FIELD_CHOICES)
     parser.add_argument('--params', nargs='+', default=list(HOD_PARAMS), choices=list(HOD_PARAMS))
     parser.add_argument('--hod', nargs='+', default=['all'])
     parser.add_argument('--cosmo', nargs='+', default=['c000'])
     parser.add_argument('--pk-kind', type=str, default='pk_used', choices=['pk_used', 'pk_raw'])
-    parser.add_argument('--observable', type=str, default='f2pk', choices=OBSERVABLE_KINDS)
+    parser.add_argument('--observable', type=str, default='pk', choices=OBSERVABLE_KINDS)
     parser.add_argument('--derivative-kind', type=str, default='linear', choices=DERIVATIVE_KINDS)
     parser.add_argument('--fiducial-hod', type=str, default='center',)
     parser.add_argument('--n-neighbors', type=int, default=100)
@@ -53,7 +54,7 @@ def parse_args():
     parser.add_argument('--pk-file-field', type=str, default='all')
     parser.add_argument('--neighbor-target-weight', type=float, default=0.25)
     parser.add_argument('--max-other-distance', type=float, default=0.0)
-    add_bool_argument(parser, '--strict-k-range', True, '')
+    add_bool_argument(parser, '--strict-bins', True, '')
     add_bool_argument(parser, '--plot', True, '')
     parser.add_argument('--skip-missing', action='store_true')
     return parser.parse_args()
@@ -76,7 +77,7 @@ def normalize_params(values):
 def resolve_single_cosmo(values):
     tokens = [str(value).strip().lower() for value in values]
     if any(token in ('all', '*') for token in tokens):
-        raise RuntimeError('HOD derivatives must be evaluated at one fiducial cosmology; use --cosmo c000.')
+        raise RuntimeError('HOD derivatives must be evaluated at one fiducial cosmology -----!')
     cosmos = [normalize_cosmo(value) for value in values]
     unique = []
     for cosmo in cosmos:
@@ -413,8 +414,7 @@ def resolve_fiducial_hod(hod_params, hods, parameters, scales, requested,
 
 
 def build_pk_means(files_by_hod_cosmo, hods, cosmos, fields, pk_kind,
-                   observable, strict_k_range):
-    metadata_cache = {}
+                   observable, strict_bins):
     pk_means = {}
     reference = None
 
@@ -423,12 +423,12 @@ def build_pk_means(files_by_hod_cosmo, hods, cosmos, fields, pk_kind,
             files = files_by_hod_cosmo.get((hod, cosmo), [])
             if not files:
                 continue
-            pk = average_pk(files, fields, pk_kind, strict_k_range,
-                            observable, metadata_cache)
+            pk = average_pk(files, fields, pk_kind, strict_bins,
+                            observable)
             if reference is None:
                 reference = pk
             else:
-                pk = align_pk_to_reference(pk, reference, fields, strict_k_range)
+                pk = align_pk_to_reference(pk, reference, fields, strict_bins)
             pk_means[(hod, cosmo)] = pk
 
     if reference is None:
@@ -437,11 +437,11 @@ def build_pk_means(files_by_hod_cosmo, hods, cosmos, fields, pk_kind,
 
 
 def local_fit_formula(derivative_kind, fit_intercept):
-    left = 'O_h(k) - O_fid(k)'
-    derivative = 'dO/dtheta_i'
+    left = 'P_h(k) - P_fid(k)'
+    derivative = 'dP/dtheta_i'
     if derivative_kind == 'log':
-        left = 'ln O_h(k) - ln O_fid(k)'
-        derivative = 'd ln O/dtheta_i'
+        left = 'ln P_h(k) - ln P_fid(k)'
+        derivative = 'd ln P/dtheta_i'
     intercept = '1, ' if fit_intercept else ''
     return (f'{left} = [{intercept}x_1(h), ..., x_p(h)] beta(k), '
             'with x_i=(theta_i(h)-theta_i(fid))/sigma_i and '
@@ -674,12 +674,14 @@ def plot_field_style(field):
               'void': '#8dd3c7',
               'sheet': '#ffff99',
               'filament': '#bebada',
-              'knot': '#fb8072'}
+              'knot': '#fb8072',
+              RANDOM_VOID_FIELD: '#80b1d3'}
     labels = {'matter': 'pmatter',
               'void': 'pvoid',
               'sheet': 'psheet',
               'filament': 'pfilament',
-              'knot': 'pknot'}
+              'knot': 'pknot',
+              RANDOM_VOID_FIELD: 'prandom_void'}
     return colors.get(field, 'tab:cyan'), labels.get(field, field)
 
 
@@ -704,7 +706,7 @@ def write_derivative_plot(path, title, results, fields, parameters):
     plt = load_pyplot()
     if plt is None:
         return False
-    first = check_result_k_range(results)
+    first = check_result_bins(results)
     ylabel = derivative_axis_label(first)
     n_cols = len(parameters)
     fig_width = max(8.0, 4.4 * n_cols)
@@ -813,7 +815,7 @@ def write_metadata(path, args, candidate_hods, candidate_cosmos, results, fields
                 'fit_intercept': args.fit_intercept,
                 'neighbor_rule': (
                     'nearest HODs by Euclidean distance in normalized 5D HOD-parameter space'),
-                'strict_k_range': args.strict_k_range,
+                'strict_bins': args.strict_bins,
                 'plot': args.plot,
                 'local_fits_by_cosmo': {
                     cosmo: local_fit_to_metadata(fit)
@@ -883,7 +885,7 @@ def main():
             key=lambda value: int(value[3:]))
 
     pk_means, _ = build_pk_means(files_by_hod_cosmo, hods, cosmos, fields,
-                                 args.pk_kind, args.observable, args.strict_k_range)
+                                 args.pk_kind, args.observable, args.strict_bins)
 
     print(f'---> pk root: {pk_root}')
     print(f'---> output directory: {outdir}')

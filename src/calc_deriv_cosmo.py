@@ -8,9 +8,12 @@ import numpy as np
 
 DEFAULT_PK_ROOT = '/pscratch/sd/v/vtorresg/hod-astra-box500/power_spectra'
 DEFAULT_PARAMS_FILE = 'params/params_cosmo.csv'
-FIELDS = ('matter', 'void', 'sheet', 'filament', 'knot')
+RANDOM_VOID_FIELD = 'random_void'
+FIELDS = ('matter', 'void', 'sheet', 'filament', 'knot', RANDOM_VOID_FIELD)
 ENVIRONMENT_FIELDS = ('void', 'sheet', 'filament', 'knot')
-OBSERVABLE_KINDS = ('pk', 'f2pk')
+RANDOM_VOID_ENVIRONMENT_FIELDS = (RANDOM_VOID_FIELD, 'sheet', 'filament', 'knot')
+ALL_VOID_ENVIRONMENT_FIELDS = (RANDOM_VOID_FIELD, 'void', 'sheet', 'filament', 'knot')
+OBSERVABLE_KINDS = ('pk',)
 DERIVATIVE_KINDS = ('linear', 'log')
 PARAM_SPECS = {'Omega_b': {'column': 'omega_b', 'baseline': 'c000', 'plus': 'c100', 'minus': 'c101'},
                'omega_cdm': {'column': 'omega_cdm', 'baseline': 'c000', 'plus': 'c102', 'minus': 'c103'},
@@ -23,6 +26,10 @@ PARAM_ALIASES = {'Omega_b': 'Omega_b',
                  'n_s': 'n_s',
                  'sigma_8m': 'sigma_8m',
                  'sigma8_m': 'sigma_8m'}
+FIELD_ALIASES = {'random_voids': RANDOM_VOID_FIELD,
+                 'rand_void': RANDOM_VOID_FIELD,
+                 'randvoid': RANDOM_VOID_FIELD}
+FIELD_CHOICES = ['all'] + list(FIELDS) + sorted(FIELD_ALIASES)
 FINITE_DIFFERENCE_SCHEMES = ('central', 'forward', 'backward')
 PK_FILE_RE = re.compile(r'^pk_(?P<field_request>.+?)_zone_(?P<cosmo>c\d{3})_ph(?P<phase>\d+)'
                         r'_seed(?P<seed>\d+)_hod(?P<hod>\d+)\.csv$')
@@ -46,17 +53,17 @@ def parse_args():
     parser.add_argument('--pk-root', type=str, default=DEFAULT_PK_ROOT)
     parser.add_argument('--params-file', type=str, default=DEFAULT_PARAMS_FILE)
     parser.add_argument('--outdir', type=str, default='')
-    parser.add_argument('--fields', nargs='+', default=['all'], choices=['all'] + list(FIELDS))
+    parser.add_argument('--fields', nargs='+', default=['all'], choices=FIELD_CHOICES)
     parser.add_argument('--params', nargs='+', default=list(PARAM_SPECS), choices=list(PARAM_ALIASES))
     parser.add_argument('--hod', nargs='+', default=['all'])
     parser.add_argument('--pk-kind', type=str, default='pk_used', choices=['pk_used', 'pk_raw'])
-    parser.add_argument('--observable', type=str, default='f2pk', choices=OBSERVABLE_KINDS)
+    parser.add_argument('--observable', type=str, default='pk', choices=OBSERVABLE_KINDS)
     parser.add_argument('--derivative-kind', type=str, default='linear', choices=DERIVATIVE_KINDS)
     parser.add_argument('--finite-difference', type=str, default='central', choices=FINITE_DIFFERENCE_SCHEMES)
     parser.add_argument('--pk-file-field', type=str, default='all')
-    add_bool_argument(parser, '--match-realizations', True, 'Use only HOD/phase/seed realizations present in both cosmologies')
-    add_bool_argument(parser, '--strict-k-range', True, 'Require matching k range between paired power spectra')
-    add_bool_argument(parser, '--plot', True, 'Write a diagnostic derivative plot')
+    add_bool_argument(parser, '--match-realizations', True, '')
+    add_bool_argument(parser, '--strict-bins', True, '')
+    add_bool_argument(parser, '--plot', True, '')
     parser.add_argument('--skip-missing', action='store_true')
     return parser.parse_args()
 
@@ -86,6 +93,7 @@ def normalize_fields(values):
         return list(FIELDS)
     fields = []
     for value in values:
+        value = FIELD_ALIASES.get(str(value).strip().lower(), value)
         if value not in fields:
             fields.append(value)
     return fields
@@ -200,54 +208,10 @@ def require_fields(pk_file, fields, pk_kind):
         raise RuntimeError(f'Missing columns in {pk_file.path}: {columns}')
 
 
-def metadata_path_for_pk(path):
-    path = Path(path)
-    return path.parent / 'meta' / f'run_metadata_{path.stem}.json'
+def load_pk_csv(path, fields, pk_kind, observable):
+    if observable != 'pk':
+        raise RuntimeError(f'Unsupported observable {observable!r}; only stored P(k) is supported.')
 
-
-def load_pk_metadata(path, metadata_cache):
-    metadata_path = metadata_path_for_pk(path)
-    if metadata_path not in metadata_cache:
-        if not metadata_path.is_file():
-            raise RuntimeError(f'Missing metadata for normalized observable: {metadata_path}')
-        with open(metadata_path, 'r', encoding='utf-8') as f:
-            metadata_cache[metadata_path] = json.load(f)
-    return metadata_cache[metadata_path]
-
-
-def positive_float(value):
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return np.nan
-    return value if np.isfinite(value) and value > 0.0 else np.nan
-
-
-def field_fraction_from_metadata(field, metadata, pk_path):
-    if field == 'matter':
-        return 1.0
-
-    field_info = metadata.get('field_info') or {}
-    info = field_info.get(field) or {}
-    fraction = positive_float(info.get('selected_fraction'))
-    if np.isfinite(fraction):
-        return fraction
-
-    raw_selection = metadata.get('raw_selection') or {}
-    n_total = positive_float(raw_selection.get('n_selected'))
-    n_field = positive_float(info.get('n_selected'))
-    if np.isfinite(n_field) and np.isfinite(n_total):
-        return n_field / n_total
-
-    class_counts = (metadata.get('astra_classification') or {}).get('class_counts') or {}
-    n_field = positive_float(class_counts.get(field))
-    if np.isfinite(n_field) and np.isfinite(n_total):
-        return n_field / n_total
-
-    raise RuntimeError(f'Cannot infer selected fraction for {field} from {metadata_path_for_pk(pk_path)}')
-
-
-def load_pk_csv(path, fields, pk_kind, observable, metadata_cache):
     data = np.genfromtxt(path, delimiter=',', names=True, dtype=None, encoding=None)
     data = np.atleast_1d(data)
     names = set(data.dtype.names or [])
@@ -259,43 +223,30 @@ def load_pk_csv(path, fields, pk_kind, observable, metadata_cache):
     k = np.asarray(data['k_h_mpc'], dtype=np.float64)
     k_min = np.asarray(data['k_min_h_mpc'], dtype=np.float64) if 'k_min_h_mpc' in names else np.full_like(k, np.nan)
     k_max = np.asarray(data['k_max_h_mpc'], dtype=np.float64) if 'k_max_h_mpc' in names else np.full_like(k, np.nan)
-    if k.size != 1:
-        raise RuntimeError(f'Expected one full-range P(k) row in {path}, found {k.size}. '
-                           'Rerun src/calc_pk.py with the range-integrated output.')
-    metadata = None
-    if observable == 'f2pk' and any(field != 'matter' for field in fields):
-        metadata = load_pk_metadata(path, metadata_cache)
 
     values = {}
     for field in fields:
         values[field] = np.asarray(data[f'{pk_kind}_{field}'], dtype=np.float64)
-        if observable == 'f2pk' and field != 'matter':
-            fraction = field_fraction_from_metadata(field, metadata, path)
-            values[field] = (fraction ** 2) * values[field]
     return {'k': k, 'k_min': k_min, 'k_max': k_max, 'values': values}
 
 
-def same_k_range(a, b):
+def same_bins(a, b):
     return (a['k'].shape == b['k'].shape
+            and np.allclose(a['k'], b['k'], rtol=1.0e-8, atol=1.0e-12)
             and np.allclose(a['k_min'], b['k_min'], rtol=1.0e-8, atol=1.0e-12, equal_nan=True)
             and np.allclose(a['k_max'], b['k_max'], rtol=1.0e-8, atol=1.0e-12, equal_nan=True))
 
 
-def align_pk_to_reference(pk, reference, fields, strict_k_range):
-    if same_k_range(pk, reference):
+def align_pk_to_reference(pk, reference, fields, strict_bins):
+    if same_bins(pk, reference):
         return pk
-    if strict_k_range:
-        raise RuntimeError('P(k) files do not use an identical k range.')
+    if strict_bins:
+        raise RuntimeError('P(k) files do not use identical k bins.')
 
     aligned = {'k': reference['k'].copy(),
                'k_min': reference['k_min'].copy(),
                'k_max': reference['k_max'].copy(),
                'values': {}}
-    if pk['k'].shape == reference['k'].shape and pk['k'].size == 1:
-        for field in fields:
-            aligned['values'][field] = np.asarray(pk['values'][field], dtype=np.float64).copy()
-        return aligned
-
     order = np.argsort(pk['k'])
     for field in fields:
         aligned['values'][field] = np.interp(reference['k'], pk['k'][order],
@@ -304,19 +255,19 @@ def align_pk_to_reference(pk, reference, fields, strict_k_range):
     return aligned
 
 
-def average_pk(files, fields, pk_kind, strict_k_range, observable, metadata_cache):
+def average_pk(files, fields, pk_kind, strict_bins, observable):
     reference = None
     sums = {field: None for field in fields}
     for pk_file in files:
         require_fields(pk_file, fields, pk_kind)
-        pk = load_pk_csv(pk_file.path, fields, pk_kind, observable, metadata_cache)
+        pk = load_pk_csv(pk_file.path, fields, pk_kind, observable)
         if reference is None:
             reference = pk
             for field in fields:
                 sums[field] = pk['values'][field].astype(np.float64).copy()
             continue
 
-        pk = align_pk_to_reference(pk, reference, fields, strict_k_range)
+        pk = align_pk_to_reference(pk, reference, fields, strict_bins)
         for field in fields:
             sums[field] += pk['values'][field]
 
@@ -406,7 +357,7 @@ def finite_difference_values(numerator, denominator, delta_theta, derivative_kin
 
 def compute_derivative(parameter, params, files_by_hod_cosmo, hods, fields, pk_kind,
                        observable, derivative_kind, finite_difference,
-                       match_realizations, strict_k_range):
+                       match_realizations, strict_bins):
     spec = PARAM_SPECS[parameter]
     numerator_cosmo, denominator_cosmo = finite_difference_cosmos(spec, finite_difference)
     param_column = spec['column']
@@ -429,12 +380,11 @@ def compute_derivative(parameter, params, files_by_hod_cosmo, hods, fields, pk_k
                            f'{numerator_cosmo} has {len(numerator_files)}, '
                            f'{denominator_cosmo} has {len(denominator_files)}.')
 
-    metadata_cache = {}
-    numerator_mean = average_pk(numerator_files, fields, pk_kind, strict_k_range,
-                                observable, metadata_cache)
-    denominator_mean = average_pk(denominator_files, fields, pk_kind, strict_k_range,
-                                  observable, metadata_cache)
-    denominator_mean = align_pk_to_reference(denominator_mean, numerator_mean, fields, strict_k_range)
+    numerator_mean = average_pk(numerator_files, fields, pk_kind, strict_bins,
+                                observable)
+    denominator_mean = average_pk(denominator_files, fields, pk_kind, strict_bins,
+                                  observable)
+    denominator_mean = align_pk_to_reference(denominator_mean, numerator_mean, fields, strict_bins)
 
     derivatives = {}
     for field in fields:
@@ -452,13 +402,13 @@ def compute_derivative(parameter, params, files_by_hod_cosmo, hods, fields, pk_k
             continue
 
         hod_numerator_mean = average_pk(hod_numerator_files, fields, pk_kind,
-                                        strict_k_range, observable, metadata_cache)
+                                        strict_bins, observable)
         hod_denominator_mean = average_pk(hod_denominator_files, fields, pk_kind,
-                                          strict_k_range, observable, metadata_cache)
+                                          strict_bins, observable)
         hod_numerator_mean = align_pk_to_reference(
-            hod_numerator_mean, numerator_mean, fields, strict_k_range)
+            hod_numerator_mean, numerator_mean, fields, strict_bins)
         hod_denominator_mean = align_pk_to_reference(
-            hod_denominator_mean, numerator_mean, fields, strict_k_range)
+            hod_denominator_mean, numerator_mean, fields, strict_bins)
 
         hod_sample_keys.append((hod, hod_keys))
         for field in fields:
@@ -503,44 +453,41 @@ def compute_derivative(parameter, params, files_by_hod_cosmo, hods, fields, pk_k
                             derivative_std=derivative_std)
 
 
-def check_result_k_range(results):
+def check_result_bins(results):
     first = next(iter(results.values()))
     for parameter, result in results.items():
         if (result.k.shape != first.k.shape
+                or not np.allclose(result.k, first.k, rtol=1.0e-8, atol=1.0e-12)
                 or not np.allclose(result.k_min, first.k_min, rtol=1.0e-8, atol=1.0e-12, equal_nan=True)
                 or not np.allclose(result.k_max, first.k_max, rtol=1.0e-8, atol=1.0e-12, equal_nan=True)):
-            raise RuntimeError(f'Derivative k range for {parameter} does not match the first parameter.')
+            raise RuntimeError(f'Derivative bins for {parameter} do not match the first parameter.')
     return first
 
 
 def derivative_column_prefix(result):
     if result.derivative_kind == 'linear':
-        return 'dpk_d' if result.observable == 'pk' else 'dO_d'
+        return 'dpk_d'
     if result.derivative_kind == 'log':
-        return 'dlnpk_d' if result.observable == 'pk' else 'dlnO_d'
+        return 'dlnpk_d'
     raise ValueError(f'Unknown derivative kind: {result.derivative_kind}')
 
 
 def derivative_axis_label(result):
     if result.derivative_kind == 'linear':
-        quantity = 'P' if result.observable == 'pk' else 'O'
-        return rf'$\partial {quantity} / \partial \theta$'
+        return r'$\partial P / \partial \theta$'
     if result.derivative_kind == 'log':
-        quantity = 'P' if result.observable == 'pk' else 'O'
-        return rf'$\partial \ln {quantity} / \partial \theta$'
+        return r'$\partial \ln P / \partial \theta$'
     raise ValueError(f'Unknown derivative kind: {result.derivative_kind}')
 
 
 def observable_description(observable):
     if observable == 'pk':
         return 'P(k) columns as stored in the input CSV files'
-    if observable == 'f2pk':
-        return 'matter: P_mm(k); environments: f_alpha^2 P_alphaalpha(k)'
     raise ValueError(f'Unknown observable: {observable}')
 
 
 def write_derivative_matrix(path, results, fields, parameters):
-    first = check_result_k_range(results)
+    first = check_result_bins(results)
     prefix = derivative_column_prefix(first)
     headers = ['k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc']
     columns = [first.k, first.k_min, first.k_max]
@@ -557,7 +504,7 @@ def write_combined_environment_matrix(path, results, fields, parameters):
     if not env_fields:
         return False
 
-    first = check_result_k_range(results)
+    first = check_result_bins(results)
     prefix = derivative_column_prefix(first)
     headers = ['component_index', 'field', 'k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc']
     headers += [f'{prefix}{parameter}' for parameter in parameters]
@@ -566,10 +513,11 @@ def write_combined_environment_matrix(path, results, fields, parameters):
         writer.writerow(headers)
         component_index = 0
         for field in env_fields:
-            row = [component_index, field, first.k[0], first.k_min[0], first.k_max[0]]
-            row.extend(results[parameter].derivatives[field][0] for parameter in parameters)
-            writer.writerow(row)
-            component_index += 1
+            for i in range(first.k.size):
+                row = [component_index, field, first.k[i], first.k_min[i], first.k_max[i]]
+                row.extend(results[parameter].derivatives[field][i] for parameter in parameters)
+                writer.writerow(row)
+                component_index += 1
     return True
 
 
@@ -586,12 +534,14 @@ def plot_field_style(field):
               'void': '#8dd3c7',
               'sheet': '#ffff99',
               'filament': '#bebada',
-              'knot': '#fb8072'}
+              'knot': '#fb8072',
+              RANDOM_VOID_FIELD: '#80b1d3'}
     labels = {'matter': 'pmatter',
               'void': 'pvoid',
               'sheet': 'psheet',
               'filament': 'pfilament',
-              'knot': 'pknot'}
+              'knot': 'pknot',
+              RANDOM_VOID_FIELD: 'prandom_void'}
     return colors.get(field, 'tab:cyan'), labels.get(field, field)
 
 
@@ -613,7 +563,7 @@ def load_pyplot():
 
 def write_derivative_plot(path, title, results, fields, parameters):
     plt = load_pyplot()
-    first = check_result_k_range(results)
+    first = check_result_bins(results)
     ylabel = derivative_axis_label(first)
     n_cols = len(parameters)
     fig_width = max(8.0, 4.4 * n_cols)
@@ -675,14 +625,14 @@ def write_metadata(path, args, candidate_hods, results, fields, parameters, outp
                 'candidate_hods': candidate_hods,
                 'finite_difference': args.finite_difference,
                 'finite_difference_formula': (
-                    '(mean(O_numerator) - mean(O_denominator)) / '
+                    '(mean(P_numerator) - mean(P_denominator)) / '
                     '(theta_numerator - theta_denominator)'
                     if args.derivative_kind == 'linear'
-                    else '(ln(mean(O_numerator)) - ln(mean(O_denominator))) / '
+                    else '(ln(mean(P_numerator)) - ln(mean(P_denominator))) / '
                          '(theta_numerator - theta_denominator)'),
                 'averaging': 'mean over all matched HOD/phase/seed datavectors before finite differencing',
                 'match_realizations': args.match_realizations,
-                'strict_k_range': args.strict_k_range,
+                'strict_bins': args.strict_bins,
                 'plot': args.plot,
                 'parameter_pairs': {},
                 'outputs': outputs}
@@ -753,7 +703,7 @@ def main():
             results[parameter] = compute_derivative(
                 parameter, params, files_by_hod_cosmo, hods, fields, args.pk_kind,
                 args.observable, args.derivative_kind, args.finite_difference,
-                args.match_realizations, args.strict_k_range)
+                args.match_realizations, args.strict_bins)
         except RuntimeError as exc:
             if args.skip_missing:
                 print(f'---> skipped {parameter}: {exc}')
@@ -768,7 +718,7 @@ def main():
 
     active_parameters = [parameter for parameter in parameters if parameter in results]
     if not active_parameters:
-        raise RuntimeError('No derivative results were produced.')
+        raise RuntimeError('No derivative results ------')
 
     plot_outdir = outdir / 'plots'
     plot_outdir.mkdir(parents=True, exist_ok=True)
@@ -780,7 +730,7 @@ def main():
     write_derivative_matrix(matrix_path, results, fields, active_parameters)
     combined_written = write_combined_environment_matrix(combined_path, results, fields, active_parameters)
     if args.plot:
-        write_derivative_plot(plot_path, 'Derivatives from mean observables over HODs', results,
+        write_derivative_plot(plot_path, 'Derivatives from mean P(k) over HODs', results,
                               fields, active_parameters)
     outputs = {'matrix': str(matrix_path),
                'combined_environment_matrix': str(combined_path) if combined_written else None,

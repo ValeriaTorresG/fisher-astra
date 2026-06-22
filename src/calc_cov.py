@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 
 from calc_deriv_cosmo import (DEFAULT_PK_ROOT, ENVIRONMENT_FIELDS, FIELDS,
+                              ALL_VOID_ENVIRONMENT_FIELDS,
+                              FIELD_ALIASES, FIELD_CHOICES,
+                              RANDOM_VOID_ENVIRONMENT_FIELDS,
                               OBSERVABLE_KINDS, add_bool_argument,
                               align_pk_to_reference, load_pk_csv,
                               normalize_cosmo, normalize_hod,
@@ -23,14 +26,16 @@ def parse_args():
     parser.add_argument('--pk-root', type=str, default=DEFAULT_PK_ROOT)
     parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--cosmo', type=str, default=DEFAULT_COSMO)
-    parser.add_argument('--fields', nargs='+', default=['all'], choices=['all'] + list(FIELDS))
+    parser.add_argument('--fields', nargs='+', default=['all'], choices=FIELD_CHOICES)
     parser.add_argument('--hod', nargs='+', default=['all'])
     parser.add_argument('--pk-kind', type=str, default='pk_used', choices=PK_KINDS)
-    parser.add_argument('--observable', type=str, default='f2pk', choices=OBSERVABLE_KINDS)
+    parser.add_argument('--observable', type=str, default='pk', choices=OBSERVABLE_KINDS)
     parser.add_argument('--pk-file-field', type=str, default='all')
+    parser.add_argument('--kmin', type=float, default=None)
+    parser.add_argument('--kmax', type=float, default=None)
     parser.add_argument('--ddof', type=int, default=1)
-    add_bool_argument(parser, '--strict-k-range', True, 'Require matching k range between all fiducial mocks')
-    add_bool_argument(parser, '--drop-nonfinite', True, 'Drop mocks with any non-finite data-vector component')
+    add_bool_argument(parser, '--strict-bins', True, '')
+    add_bool_argument(parser, '--drop-nonfinite', True, '')
     parser.add_argument('--write-data-matrix', action='store_true')
     return parser.parse_args()
 
@@ -40,6 +45,7 @@ def normalize_fields(values):
         return list(FIELDS)
     fields = []
     for value in values:
+        value = FIELD_ALIASES.get(str(value).strip().lower(), value)
         if value not in fields:
             fields.append(value)
     return fields
@@ -86,42 +92,56 @@ def discover_fiducial_pk_files(pk_root, fields, pk_kind, pk_file_field,
                                     int(item.seed), str(item.path)))
 
 
+def k_selection_mask(k, kmin, kmax):
+    mask = np.isfinite(k)
+    if kmin is not None:
+        mask &= k >= float(kmin)
+    if kmax is not None:
+        mask &= k <= float(kmax)
+    if not np.any(mask):
+        raise RuntimeError('----')
+    return mask
+
+
 def make_components(fields, k, k_min, k_max):
-    if k.size != 1:
-        raise RuntimeError(f'Expected one full-range P(k) value, found {k.size}.')
     components = []
-    for component_index, field in enumerate(fields):
-        components.append(Component(component_index=component_index,
-                                    global_component_index=component_index,
-                                    field=field,
-                                    k_h_mpc=float(k[0]),
-                                    k_min_h_mpc=float(k_min[0]),
-                                    k_max_h_mpc=float(k_max[0]),
-                                    label=field))
+    component_index = 0
+    for field in fields:
+        for k_index in range(k.size):
+            components.append(Component(component_index=component_index,
+                                        global_component_index=component_index,
+                                        field=field,
+                                        k_index=k_index,
+                                        k_h_mpc=float(k[k_index]),
+                                        k_min_h_mpc=float(k_min[k_index]),
+                                        k_max_h_mpc=float(k_max[k_index]),
+                                        label=f'{field}_k{k_index:03d}'))
+            component_index += 1
     return components
 
 
-def concatenate_fields(pk, fields):
-    return np.concatenate([np.asarray(pk['values'][field], dtype=np.float64)
+def concatenate_fields(pk, fields, mask):
+    return np.concatenate([np.asarray(pk['values'][field], dtype=np.float64)[mask]
                            for field in fields])
 
 
-def load_data_matrix(pk_files, fields, pk_kind, observable, strict_k_range,
-                     drop_nonfinite):
-    metadata_cache = {}
+def load_data_matrix(pk_files, fields, pk_kind, observable, strict_bins,
+                     drop_nonfinite, kmin, kmax):
     reference = None
+    mask = None
     rows = []
     samples = []
     dropped = []
 
     for pk_file in pk_files:
-        pk = load_pk_csv(pk_file.path, fields, pk_kind, observable, metadata_cache)
+        pk = load_pk_csv(pk_file.path, fields, pk_kind, observable)
         if reference is None:
             reference = pk
+            mask = k_selection_mask(reference['k'], kmin, kmax)
         else:
-            pk = align_pk_to_reference(pk, reference, fields, strict_k_range)
+            pk = align_pk_to_reference(pk, reference, fields, strict_bins)
 
-        vector = concatenate_fields(pk, fields)
+        vector = concatenate_fields(pk, fields, mask)
         finite = np.isfinite(vector)
         if not np.all(finite):
             info = {'hod': pk_file.hod,
@@ -148,9 +168,9 @@ def load_data_matrix(pk_files, fields, pk_kind, observable, strict_k_range,
         raise RuntimeError('No finite fiducial data vectors were loaded.')
 
     matrix = np.vstack(rows).astype(np.float64)
-    k = np.asarray(reference['k'], dtype=np.float64)
-    k_min = np.asarray(reference['k_min'], dtype=np.float64)
-    k_max = np.asarray(reference['k_max'], dtype=np.float64)
+    k = np.asarray(reference['k'], dtype=np.float64)[mask]
+    k_min = np.asarray(reference['k_min'], dtype=np.float64)[mask]
+    k_max = np.asarray(reference['k_max'], dtype=np.float64)[mask]
     components = make_components(fields, k, k_min, k_max)
     return matrix, samples, dropped, components
 
@@ -185,6 +205,7 @@ def subset_components(components, indices):
         selected.append(Component(component_index=local_index,
                                   global_component_index=component.global_component_index,
                                   field=component.field,
+                                  k_index=component.k_index,
                                   k_h_mpc=component.k_h_mpc,
                                   k_min_h_mpc=component.k_min_h_mpc,
                                   k_max_h_mpc=component.k_max_h_mpc,
@@ -192,18 +213,18 @@ def subset_components(components, indices):
     return selected
 
 
-def field_slices(fields):
+def field_slices(fields, n_k):
     slices = {}
     start = 0
     for field in fields:
-        stop = start + 1
+        stop = start + n_k
         slices[field] = slice(start, stop)
         start = stop
     return slices
 
 
 def write_components_csv(path, components):
-    headers = ['component_index', 'global_component_index', 'field',
+    headers = ['component_index', 'global_component_index', 'field', 'k_index',
                'k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc', 'label']
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -212,6 +233,7 @@ def write_components_csv(path, components):
             writer.writerow([component.component_index,
                              component.global_component_index,
                              component.field,
+                             component.k_index,
                              component.k_h_mpc,
                              component.k_min_h_mpc,
                              component.k_max_h_mpc,
@@ -219,7 +241,7 @@ def write_components_csv(path, components):
 
 
 def write_mean_csv(path, mean, cov, components):
-    headers = ['component_index', 'global_component_index', 'field',
+    headers = ['component_index', 'global_component_index', 'field', 'k_index',
                'k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc', 'mean', 'variance',
                'std']
     variance = np.diag(cov)
@@ -231,6 +253,7 @@ def write_mean_csv(path, mean, cov, components):
             writer.writerow([component.component_index,
                              component.global_component_index,
                              component.field,
+                             component.k_index,
                              component.k_h_mpc,
                              component.k_min_h_mpc,
                              component.k_max_h_mpc,
@@ -240,7 +263,7 @@ def write_mean_csv(path, mean, cov, components):
 
 
 def write_square_matrix_csv(path, matrix, components, value_prefix):
-    headers = ['component_index', 'global_component_index', 'field',
+    headers = ['component_index', 'global_component_index', 'field', 'k_index',
                'k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc']
     headers += [f'{value_prefix}_{component.label}' for component in components]
     with open(path, 'w', newline='', encoding='utf-8') as f:
@@ -250,6 +273,7 @@ def write_square_matrix_csv(path, matrix, components, value_prefix):
             row = [component.component_index,
                    component.global_component_index,
                    component.field,
+                   component.k_index,
                    component.k_h_mpc,
                    component.k_min_h_mpc,
                    component.k_max_h_mpc]
@@ -323,7 +347,9 @@ def write_metadata(path, args, outdir, fields, components, samples, dropped,
                 'observable': args.observable,
                 'observable_description': observable_description(args.observable),
                 'pk_file_field': args.pk_file_field,
-                'strict_k_range': args.strict_k_range,
+                'kmin': args.kmin,
+                'kmax': args.kmax,
+                'strict_bins': args.strict_bins,
                 'drop_nonfinite': args.drop_nonfinite,
                 'ddof': args.ddof,
                 'n_samples': len(samples),
@@ -364,16 +390,18 @@ def main():
     print(f'---> candidate mocks: {len(pk_files)}')
 
     matrix, samples, dropped, components = load_data_matrix(
-        pk_files, fields, args.pk_kind, args.observable, args.strict_k_range,
-        args.drop_nonfinite)
+        pk_files, fields, args.pk_kind, args.observable, args.strict_bins,
+        args.drop_nonfinite, args.kmin, args.kmax)
     mean_all, cov_all = sample_covariance(matrix, args.ddof)
     n_samples, n_components = matrix.shape
-    slices = field_slices(fields)
+    n_k = n_components // len(fields)
+    slices = field_slices(fields, n_k)
 
     print(f'---> finite mocks used: {n_samples}')
     if dropped:
         print(f'---> dropped non-finite mocks: {len(dropped)}')
-    print(f'---> loaded vector length: {n_components} ({len(fields)} fields)')
+    print(f'---> loaded vector length: {n_components} '
+          f'({len(fields)} fields x {n_k} k bins)')
 
     products = {}
     diagnostics = {}
@@ -409,6 +437,40 @@ def main():
         diagnostics['all'] = diagnostics['combined']
         field_slice_metadata['all'] = field_slice_metadata['combined']
 
+    if all(field in slices for field in RANDOM_VOID_ENVIRONMENT_FIELDS):
+        random_void_indices = np.concatenate(
+            [np.arange(slices[field].start, slices[field].stop)
+             for field in RANDOM_VOID_ENVIRONMENT_FIELDS])
+        random_void_components = subset_components(components, random_void_indices)
+        random_void_mean = mean_all[random_void_indices]
+        random_void_cov = cov_all[np.ix_(random_void_indices, random_void_indices)]
+        products['combined_random_void'] = write_covariance_product(
+            outdir, 'combined_random_void', random_void_mean,
+            random_void_cov, random_void_components)
+        diagnostics['combined_random_void'] = matrix_diagnostics(
+            random_void_cov, n_samples, args.ddof)
+        field_slice_metadata['combined_random_void'] = {
+            'fields': list(RANDOM_VOID_ENVIRONMENT_FIELDS),
+            'global_component_indices': random_void_indices.astype(int).tolist(),
+            'n_components': int(random_void_indices.size)}
+
+    if all(field in slices for field in ALL_VOID_ENVIRONMENT_FIELDS):
+        all_void_indices = np.concatenate(
+            [np.arange(slices[field].start, slices[field].stop)
+             for field in ALL_VOID_ENVIRONMENT_FIELDS])
+        all_void_components = subset_components(components, all_void_indices)
+        all_void_mean = mean_all[all_void_indices]
+        all_void_cov = cov_all[np.ix_(all_void_indices, all_void_indices)]
+        products['combined_all_voids'] = write_covariance_product(
+            outdir, 'combined_all_voids', all_void_mean,
+            all_void_cov, all_void_components)
+        diagnostics['combined_all_voids'] = matrix_diagnostics(
+            all_void_cov, n_samples, args.ddof)
+        field_slice_metadata['combined_all_voids'] = {
+            'fields': list(ALL_VOID_ENVIRONMENT_FIELDS),
+            'global_component_indices': all_void_indices.astype(int).tolist(),
+            'n_components': int(all_void_indices.size)}
+
     samples_path = outdir / 'samples.csv'
     write_samples_csv(samples_path, samples)
     products['samples'] = str(samples_path)
@@ -441,6 +503,10 @@ def main():
     if 'combined' in products:
         print(f'---> wrote: {products["combined"]["covariance_csv"]}')
         print(f'---> wrote alias: {products["all"]["covariance_csv"]}')
+    if 'combined_random_void' in products:
+        print(f'---> wrote: {products["combined_random_void"]["covariance_csv"]}')
+    if 'combined_all_voids' in products:
+        print(f'---> wrote: {products["combined_all_voids"]["covariance_csv"]}')
     print(f'---> wrote: {metadata_path}')
     print(f'---> wrote: {summary_path}')
     print(f"---> elapsed: {summary['elapsed_sec']:.2f} s")

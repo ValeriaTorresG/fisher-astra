@@ -10,9 +10,12 @@ from calc_deriv_hod import HOD_PARAMS
 
 
 DATA_FIELDS = tuple(FIELDS)
-CASE_CHOICES = DATA_FIELDS + ('combined', 'all')
-DERIVATIVE_PREFIXES = ('dO_d', 'dpk_d', 'dlnO_d', 'dlnpk_d')
-LOG_PREFIXES = ('dlnO_d', 'dlnpk_d')
+CASE_ORDER = ('matter', 'void', 'sheet', 'filament', 'knot',
+              'combined', 'random_void', 'combined_random_void',
+              'combined_all_voids')
+CASE_CHOICES = CASE_ORDER + ('all',)
+DERIVATIVE_PREFIXES = ('dpk_d', 'dlnpk_d')
+LOG_PREFIXES = ('dlnpk_d',)
 DERIVATIVE_FILENAMES = {
     'cosmo': ('deriv_cosmo.csv', 'deriv_cosmo_combined_env.csv'),
     'hod': ('deriv_hod.csv', 'deriv_hod_combined_env.csv')}
@@ -52,7 +55,7 @@ def parse_args():
 
 def normalize_cases(values):
     if 'all' in values:
-        return list(DATA_FIELDS) + ['combined']
+        return list(CASE_ORDER)
     cases = []
     for value in values:
         if value not in cases:
@@ -115,7 +118,7 @@ def derivative_column_info(column):
 
 
 def split_field_derivative_column(column):
-    for field in DATA_FIELDS:
+    for field in sorted(DATA_FIELDS, key=len, reverse=True):
         suffix = f'_{field}'
         if not column.endswith(suffix):
             continue
@@ -163,17 +166,17 @@ def load_combined_derivatives(path):
         raise RuntimeError(f'Mixed derivative kinds found in {path}: {sorted(derivative_kinds)}')
 
     records = []
-    seen_fields = set()
+    field_counts = {field: 0 for field in DATA_FIELDS}
     for row in rows:
         field = row.get('field', '').strip()
         if field not in DATA_FIELDS:
             continue
-        if field in seen_fields:
-            raise RuntimeError(f'Expected one full-range derivative row for {field} in {path}.')
-        seen_fields.add(field)
+        k_index = field_counts[field]
+        field_counts[field] += 1
         values = {parameter: parse_float(row[column], path, column)
                   for parameter, column in derivative_columns.items()}
         records.append(DerivativeRecord(field=field,
+                                        k_index=k_index,
                                         k_h_mpc=parse_float(row['k_h_mpc'], path, 'k_h_mpc'),
                                         k_min_h_mpc=parse_float(row['k_min_h_mpc'], path, 'k_min_h_mpc'),
                                         k_max_h_mpc=parse_float(row['k_max_h_mpc'], path, 'k_max_h_mpc'),
@@ -205,12 +208,9 @@ def load_matrix_derivatives(path):
         raise RuntimeError(f'No field derivative columns found in {path}')
     if len(derivative_kinds) != 1:
         raise RuntimeError(f'Mixed derivative kinds found in {path}: {sorted(derivative_kinds)}')
-    if len(rows) != 1:
-        raise RuntimeError(f'Expected one full-range derivative row in {path}, found {len(rows)}.')
-
     records = []
     for field in [item for item in DATA_FIELDS if item in fields]:
-        for row in rows:
+        for k_index, row in enumerate(rows):
             values = {}
             for parameter in parameters:
                 column = columns_by_field_param.get((field, parameter))
@@ -219,6 +219,7 @@ def load_matrix_derivatives(path):
             if values:
                 records.append(DerivativeRecord(
                     field=field,
+                    k_index=k_index,
                     k_h_mpc=parse_float(row['k_h_mpc'], path, 'k_h_mpc'),
                     k_min_h_mpc=parse_float(row['k_min_h_mpc'], path, 'k_min_h_mpc'),
                     k_max_h_mpc=parse_float(row['k_max_h_mpc'], path, 'k_max_h_mpc'),
@@ -266,13 +267,10 @@ def find_matching_derivative_record(target, records):
     for record in records:
         if record.field != target.field:
             continue
-        if (np.isclose(record.k_min_h_mpc, target.k_min_h_mpc,
-                       rtol=1.0e-8, atol=1.0e-12, equal_nan=True)
-                and np.isclose(record.k_max_h_mpc, target.k_max_h_mpc,
-                               rtol=1.0e-8, atol=1.0e-12, equal_nan=True)):
+        if np.isclose(record.k_h_mpc, target.k_h_mpc,
+                      rtol=1.0e-8, atol=1.0e-12):
             return record
-    raise RuntimeError(f'No derivative row matches {target.field}, '
-                       f'k range [{target.k_min_h_mpc}, {target.k_max_h_mpc}].')
+    raise RuntimeError(f'No derivative row matches {target.field}, k={target.k_h_mpc}.')
 
 
 def merge_derivative_records(inputs):
@@ -302,6 +300,7 @@ def merge_derivative_records(inputs):
                 values[parameter] = value
         merged_records.append(DerivativeRecord(
             field=base_record.field,
+            k_index=base_record.k_index,
             k_h_mpc=base_record.k_h_mpc,
             k_min_h_mpc=base_record.k_min_h_mpc,
             k_max_h_mpc=base_record.k_max_h_mpc,
@@ -346,20 +345,17 @@ def load_pipeline_derivatives(args):
 def load_components(path):
     rows, _ = read_csv_rows(path)
     components = []
-    seen_fields = set()
     for row in rows:
         field = row['field']
-        if field in seen_fields:
-            raise RuntimeError(f'Expected one covariance component for {field} in {path}.')
-        seen_fields.add(field)
         components.append(Component(
             component_index=int(row['component_index']),
             global_component_index=int(row.get('global_component_index', row['component_index'])),
             field=field,
+            k_index=int(row['k_index']),
             k_h_mpc=float(row['k_h_mpc']),
             k_min_h_mpc=float(row['k_min_h_mpc']),
             k_max_h_mpc=float(row['k_max_h_mpc']),
-            label=row.get('label') or field))
+            label=row.get('label') or f"{field}_k{int(row['k_index']):03d}"))
     return components
 
 
@@ -373,14 +369,10 @@ def derivative_records_by_field(records):
 def find_derivative_record(component, records_by_field):
     candidates = records_by_field.get(component.field, [])
     for record in candidates:
-        if (np.isclose(record.k_min_h_mpc, component.k_min_h_mpc,
-                       rtol=1.0e-8, atol=1.0e-12, equal_nan=True)
-                and np.isclose(record.k_max_h_mpc, component.k_max_h_mpc,
-                               rtol=1.0e-8, atol=1.0e-12, equal_nan=True)):
+        if np.isclose(record.k_h_mpc, component.k_h_mpc, rtol=1.0e-8, atol=1.0e-12):
             return record
     raise RuntimeError(f'No derivative row matches component {component.label} '
-                       f'({component.field}, k range '
-                       f'[{component.k_min_h_mpc}, {component.k_max_h_mpc}]).')
+                       f'({component.field}, k={component.k_h_mpc}).')
 
 
 def build_derivative_matrix(records, components, parameters):
@@ -514,7 +506,7 @@ def write_named_matrix_csv(path, matrix, labels, index_name):
 
 
 def write_derivative_matrix_csv(path, derivative, components, parameters):
-    headers = ['component_index', 'global_component_index', 'field',
+    headers = ['component_index', 'global_component_index', 'field', 'k_index',
                'k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc', 'label']
     headers += [f'dd_d{parameter}' for parameter in parameters]
     with open(path, 'w', newline='', encoding='utf-8') as f:
@@ -524,6 +516,7 @@ def write_derivative_matrix_csv(path, derivative, components, parameters):
             row = [component.component_index,
                    component.global_component_index,
                    component.field,
+                   component.k_index,
                    component.k_h_mpc,
                    component.k_min_h_mpc,
                    component.k_max_h_mpc,
@@ -601,11 +594,7 @@ def main():
     records, available_parameters, derivative_kind, derivative_inputs = (
         load_pipeline_derivatives(args))
     if derivative_kind == 'log' and not args.allow_log_derivatives:
-        raise RuntimeError(
-            'The derivative file contains logarithmic derivatives (dlnO/dtheta or dlnP/dtheta). '
-            'For the requested Fisher formula with data vector P(k) or O(k), rerun '
-            'src/calc_deriv_cosmo.py with --derivative-kind linear, or pass '
-            '--allow-log-derivatives only if your covariance is also in log-data space.')
+        raise RuntimeError('--- !TODO')
 
     parameters = normalize_params(args.params, available_parameters)
     cov_metadata, cov_metadata_path = load_cov_metadata(args.cov_dir)
@@ -647,7 +636,7 @@ def main():
 
         hartlap_factor = None
         if args.hartlap_correction:
-            hartlap_factor = hartlap_factor_from_metadata(cov_metadata, name)
+            hartlap_factor = hartlap_factor_from_metadata(cov_metadata, name) #!TODO ---------------------
             if hartlap_factor is None:
                 raise RuntimeError(f'Hartlap correction requested but unavailable for case {name}.')
             precision *= hartlap_factor

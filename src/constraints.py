@@ -5,7 +5,9 @@ import numpy as np
 
 
 DEFAULT_FISHER_DIR = '/pscratch/sd/v/vtorresg/hod-astra-box500/power_spectra/fisher_cosmo_hod'
-ENV_CASES = ('matter', 'void', 'sheet', 'filament', 'knot', 'combined')
+ENV_CASES = ('matter', 'void', 'sheet', 'filament', 'knot',
+             'combined', 'random_void', 'combined_random_void',
+             'combined_all_voids')
 COSMO_PARAMS = ('Omega_b', 'omega_cdm', 'n_s', 'sigma_8m')
 HOD_PARAMS = ('LOGM_CUT', 'LOGM1', 'SIGMA', 'ALPHA', 'KAPPA')
 DEFAULT_PARAMS = COSMO_PARAMS + HOD_PARAMS
@@ -21,7 +23,7 @@ PARAM_ALIASES.update({parameter.lower(): parameter for parameter in HOD_PARAMS})
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--fisher-dir', type=str, default=DEFAULT_FISHER_DIR)
-    parser.add_argument('--cases', nargs='+', default=['all'], choices=list(ENV_CASES) + ['each'])
+    parser.add_argument('--cases', nargs='+', default=['all'], choices=list(ENV_CASES) + ['all', 'each'])
     parser.add_argument('--params', nargs='+', default=['all'])
     parser.add_argument('--out', type=str, default='')
     return parser.parse_args()

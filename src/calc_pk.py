@@ -9,7 +9,14 @@ from pypower import CatalogFFTPower
 
 DEFAULT_DATA_ROOT = '/pscratch/sd/v/vtorresg/hod-astra-box500'
 DEFAULT_KMAX = 0.5
+DEFAULT_K_BIN_WIDTH_FACTOR = 2.0
 ENVIRONMENTS = ('void', 'sheet', 'filament', 'knot')
+RANDOM_VOID_FIELD = 'random_void'
+FIELDS = ('matter',) + ENVIRONMENTS + (RANDOM_VOID_FIELD,)
+FIELD_ALIASES = {'random_voids': RANDOM_VOID_FIELD,
+                 'rand_void': RANDOM_VOID_FIELD,
+                 'randvoid': RANDOM_VOID_FIELD}
+FIELD_CHOICES = ['all'] + list(FIELDS) + sorted(FIELD_ALIASES)
 PROB_COLS = {'void': 'PVOID',
              'sheet': 'PSHEET',
              'filament': 'PFILAMENT',
@@ -36,7 +43,7 @@ def parse_args():
     parser.add_argument('--prob-file', type=str, default='')
     parser.add_argument('--cosmo', nargs='+', default=['all'])
     parser.add_argument('--hod', nargs='+', default=['all'])
-    parser.add_argument('--field', type=str, default='all', choices=['matter', 'all'] + list(ENVIRONMENTS))
+    parser.add_argument('--field', type=str, default='all', choices=FIELD_CHOICES)
     parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--boxsize', type=float, default=500.0)
     parser.add_argument('--boxcenter', nargs=3, type=float, default=[0.0, 0.0, 0.0])
@@ -49,6 +56,7 @@ def parse_args():
     parser.add_argument('--data-randiter', type=int, default=-1)
     parser.add_argument('--use-all-rows', action='store_true')
     parser.add_argument('--subtract-shotnoise', action='store_true')
+    parser.add_argument('--k-bin-width', type=float, default=0.0)
     parser.add_argument('--kmax', type=float, default=DEFAULT_KMAX)
     parser.add_argument('--unmatched-policy', type=str, default='error', choices=['error', 'drop'])
     parser.add_argument('--plot', action=argparse.BooleanOptionalAction, default=True)
@@ -83,6 +91,11 @@ def normalize_hod(value):
     return f'hod{int(value):03d}'
 
 
+def normalize_field(value):
+    field = str(value).strip().lower()
+    return FIELD_ALIASES.get(field, field)
+
+
 def parse_raw_metadata(raw_path):
     match = RAW_NAME_RE.match(Path(raw_path).name)
     tag = strip_fits_suffix(raw_path)
@@ -115,9 +128,24 @@ def derive_probability_path(raw_path):
 
 
 def expand_requested_fields(field):
+    field = normalize_field(field)
     if field == 'all':
-        return ['matter'] + list(ENVIRONMENTS)
+        return list(FIELDS)
     return [field]
+
+
+def csv_has_power_fields(path, fields):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            header = [item.strip() for item in f.readline().strip().split(',')]
+    except OSError:
+        return False
+    names = set(header)
+    required = {'k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc'}
+    for field in fields:
+        required.add(f'pk_raw_{field}')
+        required.add(f'pk_used_{field}')
+    return required.issubset(names)
 
 
 def discover_jobs(args):
@@ -255,11 +283,16 @@ def load_environment_classes(targetid_data, probability_path, unmatched_policy):
 
     class_data = np.full(tid_data.size, -1, dtype=np.int16)
     max_prob_data = np.full(tid_data.size, np.nan, dtype=np.float64)
+    prob_data_matched = np.full((tid_data.size, len(ENVIRONMENTS)), np.nan, dtype=np.float64)
     if np.any(matched):
         class_data[matched] = class_sorted[idx[matched]]
         max_prob_data[matched] = max_prob_sorted[idx[matched]]
+        prob_data_matched[matched] = probs[order][idx[matched]]
 
     counts = {env: int(np.sum(class_data == i)) for i, env in enumerate(ENVIRONMENTS)}
+    any_iteration_counts = {
+        env: int(np.sum(np.isfinite(prob_data_matched[:, i]) & (prob_data_matched[:, i] > 0.0)))
+        for i, env in enumerate(ENVIRONMENTS)}
     info = {'probability_path': str(probability_path),
             'n_probability_rows': int(tid_prob.size),
             'n_data': int(tid_data.size),
@@ -268,8 +301,9 @@ def load_environment_classes(targetid_data, probability_path, unmatched_policy):
             'unmatched_policy': unmatched_policy,
             'class_rule': 'argmax(PVOID, PSHEET, PFILAMENT, PKNOT)',
             'class_counts': counts,
+            'any_iteration_class_counts': any_iteration_counts,
             'mean_max_probability': float(np.nanmean(max_prob_data)) if np.any(matched) else np.nan}
-    return class_data, max_prob_data, info
+    return class_data, max_prob_data, prob_data_matched, info
 
 
 def mas_to_resampler(mas):
@@ -277,8 +311,8 @@ def mas_to_resampler(mas):
     return mapping[mas.upper()]
 
 
-def make_k_range_edges(boxsize, nmesh, kmax):
-    """Return the single k interval used for the range-integrated observable."""
+def make_k_edges(boxsize, nmesh, k_bin_width, kmax):
+    """Return fixed k-bin edges shared by every P(k) for one catalog."""
     boxsize = float(boxsize)
     nmesh = int(nmesh)
     if boxsize <= 0.0:
@@ -286,24 +320,42 @@ def make_k_range_edges(boxsize, nmesh, kmax):
     if nmesh <= 0:
         raise ValueError(f'nmesh must be positive, got {nmesh}.')
 
+    k_fundamental = 2.0 * np.pi / boxsize
+    dk = DEFAULT_K_BIN_WIDTH_FACTOR * k_fundamental if k_bin_width <= 0.0 else float(k_bin_width)
+    if not np.isfinite(dk) or dk <= 0.0:
+        raise ValueError(f'k-bin width must be positive, got {dk}.')
+
     k_nyquist = np.pi * float(nmesh) / boxsize
     k_stop = k_nyquist if kmax <= 0.0 else min(float(kmax), k_nyquist)
     if not np.isfinite(k_stop) or k_stop <= 0.0:
         raise ValueError(f'kmax must define a positive k range, got {kmax}.')
-    return np.asarray([0.0, k_stop], dtype=np.float64)
+
+    n_bins = max(1, int(np.ceil(k_stop / dk - 1.0e-12)))
+    return dk * np.arange(n_bins + 1, dtype=np.float64)
 
 
-def k_range_metadata(edges, boxsize, nmesh, requested_kmax):
+def k_binning_metadata(edges, boxsize, nmesh, requested_k_bin_width, requested_kmax):
     edges = np.asarray(edges, dtype=np.float64)
+    widths = np.diff(edges)
     k_fundamental = 2.0 * np.pi / float(boxsize)
     k_nyquist = np.pi * float(nmesh) / float(boxsize)
     target_kmax = float(requested_kmax)
+    if widths.size:
+        binning_kmax = target_kmax if target_kmax > 0.0 else k_nyquist
+        nominal_n_bins = binning_kmax / widths[0]
+    else:
+        nominal_n_bins = np.nan
     return {'fundamental_mode_h_mpc': float(k_fundamental),
-            'k_min_h_mpc': float(edges[0]) if edges.size else np.nan,
-            'k_max_h_mpc': float(edges[-1]) if edges.size else np.nan,
+            'delta_k_h_mpc': float(widths[0]) if widths.size else np.nan,
+            'delta_k_over_k_fundamental': float(widths[0] / k_fundamental) if widths.size else np.nan,
+            'binning_rule': 'Delta k = 2 * k_fundamental = 4*pi/boxsize',
+            'nominal_n_bins_target_kmax_over_delta_k': float(nominal_n_bins) if widths.size else np.nan,
+            'n_bins': int(widths.size),
+            'k_min_edge_h_mpc': float(edges[0]) if edges.size else np.nan,
+            'k_max_edge_h_mpc': float(edges[-1]) if edges.size else np.nan,
             'target_kmax_h_mpc': target_kmax,
             'nyquist_h_mpc': float(k_nyquist),
-            'definition': 'single P(k) observable over the full requested k range'}
+            'requested_k_bin_width_h_mpc': float(requested_k_bin_width)}
 
 
 def to_scalar_float(value, default=np.nan):
@@ -408,7 +460,7 @@ def compute_pk(positions, weights, k_edges, args):
     if positions.shape[0] == 0:
         raise RuntimeError('Cannot compute P(k): selected field has zero galaxies.')
     result = compute_pk_pypower(positions, weights, k_edges, args)
-    result['k_range_edges'] = np.asarray(k_edges, dtype=np.float64).copy()
+    result['k_edges'] = np.asarray(k_edges, dtype=np.float64).copy()
 
     volume = float(args.boxsize) ** 3
     sw = float(np.sum(weights, dtype=np.float64))
@@ -444,10 +496,10 @@ def write_csv(path, results):
     fields = list(results)
     first = results[fields[0]]
     k = first['k']
-    k_range_edges = np.asarray(first.get('k_range_edges', []), dtype=np.float64)
-    if k_range_edges.size == 2 and k.size == 1:
-        k_min = np.asarray([k_range_edges[0]], dtype=np.float64)
-        k_max = np.asarray([k_range_edges[1]], dtype=np.float64)
+    k_edges = np.asarray(first.get('k_edges', []), dtype=np.float64)
+    if k_edges.size == k.size + 1:
+        k_min = k_edges[:-1]
+        k_max = k_edges[1:]
     else:
         k_min = np.full_like(k, np.nan, dtype=np.float64)
         k_max = np.full_like(k, np.nan, dtype=np.float64)
@@ -455,13 +507,8 @@ def write_csv(path, results):
     headers = ['k_h_mpc', 'k_min_h_mpc', 'k_max_h_mpc', 'nmodes']
     for field in fields:
         result = results[field]
-        pk_raw = np.asarray(result['pk_raw'], dtype=np.float64)
-        pk_used = np.asarray(result['pk_used'], dtype=np.float64)
-        if pk_raw.shape != k.shape or pk_used.shape != k.shape:
-            raise RuntimeError(f'Unexpected P(k) shape for {field}: '
-                               f'{pk_raw.shape}, {pk_used.shape}; expected {k.shape}.')
-        cols.append(pk_raw)
-        cols.append(pk_used)
+        cols.append(align_to_k(k, result['k'], result['pk_raw']))
+        cols.append(align_to_k(k, result['k'], result['pk_used']))
         headers.append(f'pk_raw_{field}')
         headers.append(f'pk_used_{field}')
     np.savetxt(path, np.column_stack(cols), delimiter=',',
@@ -519,15 +566,18 @@ def result_metadata(result):
 
 
 def process_job(job, args, outdir):
+    args.field = normalize_field(args.field)
     requested_fields = expand_requested_fields(args.field)
     job_outdir = resolve_job_outdir(outdir, job)
     csv_path = job_outdir / f'pk_{args.field}_{job.tag}.csv'
     meta_path = job_outdir / 'meta' / f'run_metadata_pk_{args.field}_{job.tag}.json'
     plot_path = job_outdir / 'plots' / f'pk_{args.field}_{job.tag}.png'
 
-    if args.skip_existing and csv_path.is_file():
+    if args.skip_existing and csv_path.is_file() and csv_has_power_fields(csv_path, requested_fields):
         print(f'---> skipping existing: {csv_path}')
         return {'skipped': True, 'csv': str(csv_path)}
+    if args.skip_existing and csv_path.is_file():
+        print(f'---> existing file is missing requested columns; rebuilding: {csv_path}')
 
     raw = read_raw_catalog(job.raw_path, args.position_cols, args.weight_col,
                            args.data_randiter, args.use_all_rows)
@@ -535,18 +585,21 @@ def process_job(job, args, outdir):
 
     class_data = None
     max_prob = None
+    class_probabilities = None
     class_info = None
     needs_environment = any(field != 'matter' for field in requested_fields)
     if needs_environment:
-        class_data, max_prob, class_info = load_environment_classes(
+        class_data, max_prob, class_probabilities, class_info = load_environment_classes(
             raw['targetid'], job.probability_path, args.unmatched_policy)
         print(f"---> {job.tag}: ASTRA class counts {class_info['class_counts']}")
+        print(f"---> {job.tag}: ASTRA any-iteration counts {class_info['any_iteration_class_counts']}")
 
-    k_edges = make_k_range_edges(args.boxsize, args.grid, args.kmax)
-    k_range = k_range_metadata(k_edges, args.boxsize, args.grid, args.kmax)
-    print("---> k range: "
-          f"{k_range['k_min_h_mpc']:.8f} <= k <= "
-          f"{k_range['k_max_h_mpc']:.8f} h/Mpc")
+    k_edges = make_k_edges(args.boxsize, args.grid, args.k_bin_width, args.kmax)
+    binning = k_binning_metadata(k_edges, args.boxsize, args.grid, args.k_bin_width, args.kmax)
+    print("---> k-binning: "
+          f"{binning['n_bins']} bins, "
+          f"Delta k = {binning['delta_k_h_mpc']:.8f} h/Mpc, "
+          f"kmax edge = {binning['k_max_edge_h_mpc']:.8f} h/Mpc")
     positions = raw['positions']
     weights = raw['weights']
     results = {}
@@ -556,6 +609,11 @@ def process_job(job, args, outdir):
         if field == 'matter':
             field_mask = np.ones(positions.shape[0], dtype=bool)
             mark_desc = 'unmarked matter field'
+        elif field == RANDOM_VOID_FIELD:
+            void_index = ENVIRONMENTS.index('void')
+            void_probability = class_probabilities[:, void_index]
+            field_mask = np.isfinite(void_probability) & (void_probability > 0.0)
+            mark_desc = 'random-iteration ASTRA void union: PVOID > 0'
         else:
             env_index = ENVIRONMENTS.index(field)
             field_mask = class_data == env_index
@@ -568,10 +626,15 @@ def process_job(job, args, outdir):
         print(f'---> {job.tag}: computing {field} P(k) with {n_field} galaxies')
         results[field] = compute_pk(positions[field_mask], weights[field_mask], k_edges, args)
         field_info[field] = {'mark': mark_desc,
-                             'n_selected': n_field,
-                             'selected_fraction': float(n_field / positions.shape[0])}
+                             'n_selected': n_field}
         if field != 'matter' and max_prob is not None:
             field_info[field]['mean_max_probability_selected'] = float(np.nanmean(max_prob[field_mask]))
+        if field == RANDOM_VOID_FIELD and class_probabilities is not None:
+            void_index = ENVIRONMENTS.index('void')
+            pvoid = class_probabilities[:, void_index]
+            field_info[field]['probability_column'] = PROB_COLS['void']
+            field_info[field]['selection_rule'] = 'PVOID > 0'
+            field_info[field]['mean_pvoid_selected'] = float(np.nanmean(pvoid[field_mask]))
 
     write_csv(csv_path, results)
     plot_written = False
@@ -599,8 +662,9 @@ def process_job(job, args, outdir):
                 'interlacing': args.interlacing,
                 'engine_requested': args.engine,
                 'subtract_shotnoise': args.subtract_shotnoise,
+                'k_bin_width': args.k_bin_width,
                 'kmax': args.kmax,
-                'k_range': k_range,
+                'binning': binning,
                 'outputs': {'csv': str(csv_path),
                             'metadata': str(meta_path),
                             'plot': str(plot_path) if plot_written else None}}
@@ -621,6 +685,7 @@ def process_job(job, args, outdir):
 
 def main():
     args = parse_args()
+    args.field = normalize_field(args.field)
     t0 = time.time()
     outdir = resolve_outdir(args)
     jobs = discover_jobs(args)
